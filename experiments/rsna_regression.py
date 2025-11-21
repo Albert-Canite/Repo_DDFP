@@ -101,8 +101,10 @@ class RegressionNet(nn.Module):
 def train_regression_model():
     items = load_bbox_items(limit=C.RSNA_TRAIN_SAMPLES + C.RSNA_VAL_SAMPLES)
     dataset = RSNABBoxDataset(items)
-    val_size = min(C.RSNA_VAL_SAMPLES, len(dataset) // 5)
+    val_size = min(C.RSNA_VAL_SAMPLES, max(len(dataset) // 5, 1))
     train_size = len(dataset) - val_size
+    if train_size <= 0:
+        raise RuntimeError("训练样本不足，请提高 RSNA_TRAIN_SAMPLES 或检查标签文件")
     train_set, val_set = random_split(dataset, [train_size, val_size])
 
     train_loader = DataLoader(train_set, batch_size=C.RSNA_BATCH_SIZE, shuffle=True)
@@ -171,6 +173,9 @@ def run_regression_flow():
     model = load_or_train_model()
     items = load_bbox_items(limit=C.NUM_TEST + C.NUM_CALIBRATION + C.RSNA_VAL_SAMPLES)
     dataset = RSNABBoxDataset(items)
+
+    if len(dataset) <= C.NUM_CALIBRATION:
+        raise RuntimeError("数据量不足以划分校准集和测试集，请增大 NUM_TEST/NUM_CALIBRATION 配置")
 
     calib_set, test_set = random_split(dataset, [C.NUM_CALIBRATION, len(dataset) - C.NUM_CALIBRATION])
     calib_imgs = [img.numpy() for img, _ in calib_set]
@@ -259,3 +264,8 @@ def save_regression_fig(test_set, fp_preds, ddfp_preds, base_preds, gts):
     plt.tight_layout()
     fig.savefig(C.REGRESSION_OUTPUT_IMG, dpi=150)
     print(f"[Saved] {C.REGRESSION_OUTPUT_IMG}")
+
+
+if __name__ == "__main__":
+    print("[Task] RSNA bbox regression + DDFP 对比")
+    run_regression_flow()

@@ -4,7 +4,13 @@ import os
 from pathlib import Path
 
 YOLO_ROOT = Path(__file__).resolve().parents[1]
-RSNA_DIR = YOLO_ROOT / "rsna-pneumonia-detection-challenge"
+OUTPUT_DIR = YOLO_ROOT / "outputs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# 数据集路径优先读取环境变量，其次使用用户本地默认路径，最后回退到仓库目录下的副本
+_rsna_env = os.environ.get("RSNA_DIR")
+_rsna_default = Path(r"E:\OneDrive - KAUST\ONN codes\yolo\rsna-pneumonia-detection-challenge")
+RSNA_DIR = Path(_rsna_env) if _rsna_env else (_rsna_default if _rsna_default.exists() else YOLO_ROOT / "rsna-pneumonia-detection-challenge")
 RSNA_TRAIN_IMG_DIR = RSNA_DIR / "stage_2_train_images"
 
 
@@ -47,10 +53,6 @@ DELTA_PERCENTILE = 98
 DELTA_MARGIN = 1.0
 BETA_ALIGN_ITERS = 3
 BETA_ALIGN_CLIP = (0.85, 1.15)
-
-OUTPUT_DIR = YOLO_ROOT / "outputs"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
 
 SEED = 2025
 rng = np.random.default_rng(SEED)
