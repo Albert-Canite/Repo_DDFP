@@ -72,32 +72,34 @@ def load_bbox_items(limit=None):
 
 
 class RegressionNet(nn.Module):
+    """单通道 CNN，匹配 RSNA 灰度输入与 DDFP/Baseline 的单通道卷积接口。"""
+
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 1, kernel_size=C.KERNEL_SIZE)
-        self.conv2 = nn.Conv2d(1, 1, kernel_size=C.KERNEL_SIZE)
+        self.convs = nn.ModuleList(
+            [nn.Conv2d(1, 1, kernel_size=C.KERNEL_SIZE, bias=False) for _ in range(5)]
+        )
         self.head = nn.Sequential(
-            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.AdaptiveAvgPool2d((8, 8)),
             nn.Flatten(),
-            nn.Linear(16, C.REGRESSION_HEAD_HIDDEN),
+            nn.Linear(64, C.REGRESSION_HEAD_HIDDEN1),
             nn.ReLU(),
-            nn.Linear(C.REGRESSION_HEAD_HIDDEN, 4),
+            nn.Linear(C.REGRESSION_HEAD_HIDDEN1, C.REGRESSION_HEAD_HIDDEN2),
+            nn.ReLU(),
+            nn.Linear(C.REGRESSION_HEAD_HIDDEN2, 4),
             nn.Sigmoid(),
         )
 
     def forward(self, x):
         if x.dim() == 5:
             x = x.squeeze(1)
-        x = F.relu(self.conv1(x))
-        feat = F.relu(self.conv2(x))
-        out = self.head(feat)
+        for conv in self.convs:
+            x = F.relu(conv(x))
+        out = self.head(x)
         return out
 
     def feature_kernels(self):
-        return [
-            self.conv1.weight.detach().cpu().numpy(),
-            self.conv2.weight.detach().cpu().numpy(),
-        ]
+        return [conv.weight.detach().cpu().numpy() for conv in self.convs]
 
 
 _cached_splits = None
@@ -135,8 +137,9 @@ def train_regression_model(train_set, val_set):
     val_loader = DataLoader(val_set, batch_size=C.RSNA_BATCH_SIZE)
 
     model = RegressionNet()
-    opt = torch.optim.Adam(model.parameters(), lr=C.RSNA_LR)
+    opt = torch.optim.Adam(model.parameters(), lr=C.RSNA_LR, weight_decay=C.RSNA_WEIGHT_DECAY)
     loss_fn = nn.SmoothL1Loss()
+    history = []
 
     for epoch in range(C.RSNA_EPOCHS):
         model.train()
@@ -167,6 +170,16 @@ def train_regression_model(train_set, val_set):
         else:
             val_mae, val_iou = float("nan"), float("nan")
 
+        history.append(
+            {
+                "epoch": epoch + 1,
+                "train_loss": avg_loss,
+                "val_loss": val_loss,
+                "val_mae": val_mae,
+                "val_iou": val_iou,
+            }
+        )
+
         print(
             f"[Train] epoch={epoch+1} loss={avg_loss:.4f} val_loss={val_loss:.4f} "
             f"val_mae={val_mae:.2f} val_iou={val_iou:.3f}"
@@ -174,6 +187,7 @@ def train_regression_model(train_set, val_set):
 
     C.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), C.REGRESSION_CKPT)
+    plot_training_history(history)
     return model
 
 
@@ -214,6 +228,37 @@ def sanitize_box(box):
     x2 = np.clip(x2, 0.0, C.IMAGE_SIZE)
     y2 = np.clip(y2, 0.0, C.IMAGE_SIZE)
     return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+
+def plot_training_history(history):
+    if not history:
+        return
+
+    epochs = [h["epoch"] for h in history]
+    train_loss = [h["train_loss"] for h in history]
+    val_loss = [h["val_loss"] for h in history]
+    val_mae = [h["val_mae"] for h in history]
+    val_iou = [h["val_iou"] for h in history]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].plot(epochs, train_loss, label="train_loss")
+    axes[0].plot(epochs, val_loss, label="val_loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].set_title("Loss 曲线")
+    axes[0].legend()
+
+    axes[1].plot(epochs, val_mae, label="val_mae")
+    axes[1].plot(epochs, val_iou, label="val_iou")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Metric")
+    axes[1].set_title("验证指标曲线")
+    axes[1].legend()
+
+    plt.tight_layout()
+    C.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(C.REGRESSION_TRAIN_CURVE, dpi=150)
+    print(f"[Saved] {C.REGRESSION_TRAIN_CURVE}")
 
 
 def run_regression_flow():
