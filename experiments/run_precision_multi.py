@@ -7,6 +7,7 @@ from core.utils import load_images_rsna, snr_db
 from ddfp.fp32_forward import run_network_fp32
 from ddfp.baseline_forward import run_network_baseline
 from ddfp.ddfp_forward import calibrate_ddfp, run_network_ddfp
+from experiments.rsna_regression import run_regression_flow
 
 
 def run_single_config(L, IN, W, ADC):
@@ -179,13 +180,19 @@ def run_single_config(L, IN, W, ADC):
 
 
 if __name__ == "__main__":
-    configs = list(itertools.product(
-        C.NUM_LAYERS_LIST,
-        C.INPUT_BITS_LIST,
-        C.WEIGHT_BITS_LIST,
-        C.ADC_BITS_LIST
-    ))
+    if C.TASK_TYPE == "simple":
+        configs = list(itertools.product(
+            C.NUM_LAYERS_LIST,
+            C.INPUT_BITS_LIST,
+            C.WEIGHT_BITS_LIST,
+            C.ADC_BITS_LIST
+        ))
 
-    for (L, IN, W, ADC) in configs:
-        print(f"\n=== Running Config: L={L} IN={IN} W={W} ADC={ADC} ===")
-        run_single_config(L, IN, W, ADC)
+        for (L, IN, W, ADC) in configs:
+            print(f"\n=== Running Config: L={L} IN={IN} W={W} ADC={ADC} ===")
+            run_single_config(L, IN, W, ADC)
+    elif C.TASK_TYPE == "rsna_regression":
+        print("[Task] Running RSNA bbox regression + DDFP 对比")
+        run_regression_flow()
+    else:
+        raise ValueError(f"未知 TASK_TYPE: {C.TASK_TYPE}")

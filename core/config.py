@@ -4,8 +4,15 @@ import os
 from pathlib import Path
 
 YOLO_ROOT = Path(__file__).resolve().parents[1]
-RSNA_DIR = YOLO_ROOT / "rsna-pneumonia-detection-challenge"
+OUTPUT_DIR = YOLO_ROOT / "outputs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# 数据集路径优先读取环境变量，其次使用用户本地默认路径，最后回退到仓库目录下的副本
+_rsna_env = os.environ.get("RSNA_DIR")
+_rsna_default = Path(r"E:\OneDrive - KAUST\ONN codes\yolo\rsna-pneumonia-detection-challenge")
+RSNA_DIR = Path(_rsna_env) if _rsna_env else (_rsna_default if _rsna_default.exists() else YOLO_ROOT / "rsna-pneumonia-detection-challenge")
 RSNA_TRAIN_IMG_DIR = RSNA_DIR / "stage_2_train_images"
+RSNA_TEST_IMG_DIR = RSNA_DIR / "stage_2_test_images"  # 官方测试集无标签，可用于纯推理对比
 
 
 IMAGE_SIZE = 512
@@ -14,10 +21,27 @@ NUM_CALIBRATION = 50
 NUM_TEST = 2
 KERNEL_SIZE = 4
 
+# 任务选择："simple" 为原有卷积测试，"rsna_regression" 为 RSNA 小型回归网络
+TASK_TYPE = "simple"
+
 NUM_LAYERS_LIST = [1]
 INPUT_BITS_LIST = [5]
 WEIGHT_BITS_LIST = [5]
 ADC_BITS_LIST = [8]
+
+# RSNA 回归任务设置
+RSNA_LABEL_CSV = RSNA_DIR / "stage_2_train_labels.csv"
+RSNA_TRAIN_SAMPLES = 800
+RSNA_VAL_SAMPLES = 200
+RSNA_BATCH_SIZE = 16
+RSNA_EPOCHS = 40
+RSNA_LR = 1e-3
+RSNA_WEIGHT_DECAY = 1e-4
+REGRESSION_HEAD_HIDDEN1 = 128
+REGRESSION_HEAD_HIDDEN2 = 64
+REGRESSION_OUTPUT_IMG = OUTPUT_DIR / "rsna_regression_comparison.png"
+REGRESSION_TRAIN_CURVE = OUTPUT_DIR / "rsna_regression_training.png"
+REGRESSION_CKPT = OUTPUT_DIR / "rsna_regression.ckpt"
 
 WEIGHT_SIGNED = True
 ADC_SIGNED = True
@@ -33,10 +57,6 @@ DELTA_PERCENTILE = 98
 DELTA_MARGIN = 1.0
 BETA_ALIGN_ITERS = 3
 BETA_ALIGN_CLIP = (0.85, 1.15)
-
-OUTPUT_DIR = YOLO_ROOT / "outputs"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
 
 SEED = 2025
 rng = np.random.default_rng(SEED)
@@ -123,3 +143,11 @@ def setup_config(num_layers, input_bits, weight_bits, adc_bits):
     print(f"\n===== Setup Done: L={NUM_LAYERS}, IN={INPUT_BITS}, W={WEIGHT_BITS}, ADC={ADC_BITS} =====")
     print(f"RSNA DIR = {RSNA_DIR}")
     print(f"ImageSize = {IMAGE_SIZE}")
+
+
+def set_kernels(custom_kernels):
+    """覆盖默认的随机 kernels（用于回归模型 conv 权重）。"""
+    global kernels, _noise_bank, _w_noise_bank
+    kernels = custom_kernels
+    _noise_bank = {}
+    _w_noise_bank = {}
