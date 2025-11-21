@@ -100,15 +100,37 @@ class RegressionNet(nn.Module):
         ]
 
 
-def train_regression_model():
-    items = load_bbox_items(limit=C.RSNA_TRAIN_SAMPLES + C.RSNA_VAL_SAMPLES)
-    dataset = RSNABBoxDataset(items)
-    val_size = min(C.RSNA_VAL_SAMPLES, max(len(dataset) // 5, 1))
-    train_size = len(dataset) - val_size
-    if train_size <= 0:
-        raise RuntimeError("训练样本不足，请提高 RSNA_TRAIN_SAMPLES 或检查标签文件")
-    train_set, val_set = random_split(dataset, [train_size, val_size])
+_cached_splits = None
 
+
+def build_rsna_splits():
+    global _cached_splits
+    if _cached_splits is not None:
+        return _cached_splits
+
+    needed = C.RSNA_TRAIN_SAMPLES + C.RSNA_VAL_SAMPLES + C.NUM_CALIBRATION + C.NUM_TEST
+    items = load_bbox_items(limit=needed)
+    dataset = RSNABBoxDataset(items)
+
+    train_size = min(C.RSNA_TRAIN_SAMPLES, len(dataset))
+    remaining = len(dataset) - train_size
+    val_size = min(C.RSNA_VAL_SAMPLES, remaining)
+    remaining -= val_size
+    calib_size = min(C.NUM_CALIBRATION, remaining)
+    remaining -= calib_size
+    test_size = min(C.NUM_TEST, max(remaining, 1))
+
+    generator = torch.Generator().manual_seed(C.SEED)
+    splits = random_split(
+        dataset,
+        [train_size, val_size, calib_size, test_size],
+        generator=generator,
+    )
+    _cached_splits = splits
+    return splits
+
+
+def train_regression_model(train_set, val_set):
     train_loader = DataLoader(train_set, batch_size=C.RSNA_BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=C.RSNA_BATCH_SIZE)
 
@@ -130,31 +152,43 @@ def train_regression_model():
 
         model.eval()
         val_loss = 0.0
+        val_preds, val_targets = [], []
         with torch.no_grad():
             for imgs, targets in val_loader:
                 preds = model(imgs)
                 val_loss += loss_fn(preds, targets).item() * imgs.size(0)
+                val_preds.append(preds.detach().cpu().numpy() * C.IMAGE_SIZE)
+                val_targets.append(targets.detach().cpu().numpy() * C.IMAGE_SIZE)
         val_loss = val_loss / max(len(val_loader.dataset), 1)
+        if val_preds and val_targets:
+            val_mae, val_iou = compute_metrics(
+                np.concatenate(val_preds), np.concatenate(val_targets)
+            )
+        else:
+            val_mae, val_iou = float("nan"), float("nan")
 
-        print(f"[Train] epoch={epoch+1} loss={avg_loss:.4f} val={val_loss:.4f}")
+        print(
+            f"[Train] epoch={epoch+1} loss={avg_loss:.4f} val_loss={val_loss:.4f} "
+            f"val_mae={val_mae:.2f} val_iou={val_iou:.3f}"
+        )
 
     C.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), C.REGRESSION_CKPT)
     return model
 
 
-def load_or_train_model():
+def load_or_train_model(train_set, val_set):
     model = RegressionNet()
     if C.REGRESSION_CKPT.exists():
         model.load_state_dict(torch.load(C.REGRESSION_CKPT, map_location="cpu"))
         print(f"[Load] 使用已有模型 {C.REGRESSION_CKPT}")
         return model
-    return train_regression_model()
+    return train_regression_model(train_set, val_set)
 
 
 def compute_metrics(preds, targets):
-    preds = np.array(preds)
-    targets = np.array(targets)
+    preds = np.array([sanitize_box(p) for p in preds])
+    targets = np.array([sanitize_box(t) for t in targets])
     mae = np.mean(np.abs(preds - targets))
 
     ious = []
@@ -171,15 +205,20 @@ def compute_metrics(preds, targets):
     return mae, float(np.mean(ious))
 
 
+def sanitize_box(box):
+    x1, y1, x2, y2 = box
+    x1, x2 = sorted([x1, x2])
+    y1, y2 = sorted([y1, y2])
+    x1 = np.clip(x1, 0.0, C.IMAGE_SIZE)
+    y1 = np.clip(y1, 0.0, C.IMAGE_SIZE)
+    x2 = np.clip(x2, 0.0, C.IMAGE_SIZE)
+    y2 = np.clip(y2, 0.0, C.IMAGE_SIZE)
+    return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+
 def run_regression_flow():
-    model = load_or_train_model()
-    items = load_bbox_items(limit=C.NUM_TEST + C.NUM_CALIBRATION + C.RSNA_VAL_SAMPLES)
-    dataset = RSNABBoxDataset(items)
-
-    if len(dataset) <= C.NUM_CALIBRATION:
-        raise RuntimeError("数据量不足以划分校准集和测试集，请增大 NUM_TEST/NUM_CALIBRATION 配置")
-
-    calib_set, test_set = random_split(dataset, [C.NUM_CALIBRATION, len(dataset) - C.NUM_CALIBRATION])
+    train_set, val_set, calib_set, test_set = build_rsna_splits()
+    model = load_or_train_model(train_set, val_set)
     calib_imgs = [img.numpy() for img, _ in calib_set]
 
     kernels = [k for k in model.feature_kernels()]
@@ -197,8 +236,8 @@ def run_regression_flow():
 
         with torch.no_grad():
             fp_out = model(img.unsqueeze(0)).squeeze(0).numpy() * C.IMAGE_SIZE
-        fp_preds.append(fp_out)
-        gts.append(gt * C.IMAGE_SIZE)
+        fp_preds.append(sanitize_box(fp_out))
+        gts.append(sanitize_box(gt * C.IMAGE_SIZE))
 
         feat_fp32 = run_network_fp32(img_np, C.kernels)
         ddfp_out, _, _, _ = run_network_ddfp(img_np)
@@ -208,6 +247,7 @@ def run_regression_flow():
             tensor_feat = torch.tensor(feat, dtype=torch.float32)
             with torch.no_grad():
                 pred = model.head(tensor_feat).squeeze(0).numpy() * C.IMAGE_SIZE
+                pred = sanitize_box(pred)
             if name == "DDFP":
                 ddfp_preds.append(pred)
             else:
@@ -250,7 +290,7 @@ def save_regression_fig(test_set, fp_preds, ddfp_preds, base_preds, gts):
 
     for idx in range(rows):
         img, _ = test_set[idx]
-        img_vis = img[0].numpy()
+        img_vis = img.squeeze().numpy()
         for col, (preds, title, color) in enumerate([
             (fp_preds, "FP32 标注", "green"),
             (ddfp_preds, "DDFP 标注", "red"),

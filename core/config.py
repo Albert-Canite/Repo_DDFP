@@ -12,6 +12,7 @@ _rsna_env = os.environ.get("RSNA_DIR")
 _rsna_default = Path(r"E:\OneDrive - KAUST\ONN codes\yolo\rsna-pneumonia-detection-challenge")
 RSNA_DIR = Path(_rsna_env) if _rsna_env else (_rsna_default if _rsna_default.exists() else YOLO_ROOT / "rsna-pneumonia-detection-challenge")
 RSNA_TRAIN_IMG_DIR = RSNA_DIR / "stage_2_train_images"
+RSNA_TEST_IMG_DIR = RSNA_DIR / "stage_2_test_images"  # 官方测试集无标签，可用于纯推理对比
 
 
 IMAGE_SIZE = 512
@@ -33,7 +34,7 @@ RSNA_LABEL_CSV = RSNA_DIR / "stage_2_train_labels.csv"
 RSNA_TRAIN_SAMPLES = 200
 RSNA_VAL_SAMPLES = 20
 RSNA_BATCH_SIZE = 8
-RSNA_EPOCHS = 2
+RSNA_EPOCHS = 20
 RSNA_LR = 1e-3
 REGRESSION_HEAD_HIDDEN = 32
 REGRESSION_OUTPUT_IMG = OUTPUT_DIR / "rsna_regression_comparison.png"
