@@ -86,6 +86,8 @@ class RegressionNet(nn.Module):
         )
 
     def forward(self, x):
+        if x.dim() == 5:
+            x = x.squeeze(1)
         x = F.relu(self.conv1(x))
         feat = F.relu(self.conv2(x))
         out = self.head(feat)
