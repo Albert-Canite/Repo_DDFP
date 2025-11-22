@@ -1,6 +1,7 @@
 import numpy as np
 from pathlib import Path
 import pydicom
+from pydicom.pixel_data_handlers.util import apply_modality_lut, apply_voi_lut
 import cv2
 import torch
 import torch.nn.functional as F
@@ -15,13 +16,16 @@ from core.config import (
 
 def load_dicom_image(path):
     dcm = pydicom.dcmread(path)
-    img = dcm.pixel_array.astype(np.float32)
 
-    maxv = img.max()
-    if maxv == 0:
-        maxv = 1.0
-    img = img / maxv
+    img = apply_modality_lut(dcm.pixel_array, dcm).astype(np.float32)
+    if hasattr(dcm, "WindowCenter") and hasattr(dcm, "WindowWidth"):
+        img = apply_voi_lut(img, dcm)
+    else:
+        center, width = -600.0, 1500.0
+        img = np.clip(img, center - width / 2, center + width / 2)
 
+    vmin, vmax = img.min(), img.max()
+    img = (img - vmin) / (vmax - vmin + 1e-8)
     if INPUT_SIGNED:
         img = img - 0.5
 
