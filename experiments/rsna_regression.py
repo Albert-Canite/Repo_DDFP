@@ -166,7 +166,8 @@ def train_regression_model(train_set, val_set):
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, factor=0.3, patience=4, verbose=False, min_lr=1e-5
     )
-    loss_fn = nn.SmoothL1Loss()
+    # Align training objective with pixel-space MAE used for reporting
+    loss_fn = nn.L1Loss()
     history = []
     best_state = None
     best_val = float("inf")
@@ -178,7 +179,9 @@ def train_regression_model(train_set, val_set):
         for imgs, targets in train_loader:
             opt.zero_grad()
             preds = model(imgs)
-            loss = loss_fn(preds, targets)
+            preds_pix = preds * C.IMAGE_SIZE
+            targets_pix = targets * C.IMAGE_SIZE
+            loss = loss_fn(preds_pix, targets_pix)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
@@ -191,9 +194,11 @@ def train_regression_model(train_set, val_set):
         with torch.no_grad():
             for imgs, targets in val_loader:
                 preds = model(imgs)
-                val_loss += loss_fn(preds, targets).item() * imgs.size(0)
-                val_preds.append(preds.detach().cpu().numpy() * C.IMAGE_SIZE)
-                val_targets.append(targets.detach().cpu().numpy() * C.IMAGE_SIZE)
+                preds_pix = preds * C.IMAGE_SIZE
+                targets_pix = targets * C.IMAGE_SIZE
+                val_loss += loss_fn(preds_pix, targets_pix).item() * imgs.size(0)
+                val_preds.append(preds_pix.detach().cpu().numpy())
+                val_targets.append(targets_pix.detach().cpu().numpy())
         val_loss = val_loss / max(len(val_loader.dataset), 1)
         if val_preds and val_targets:
             val_mae, val_iou = compute_metrics(
@@ -218,18 +223,19 @@ def train_regression_model(train_set, val_set):
             f"val_mae={val_mae:.2f} val_iou={val_iou:.3f}"
         )
 
-        scheduler.step(val_loss)
+        # Drive learning-rate scheduling by validation MAE to match the target metric
+        scheduler.step(val_mae)
 
-        if val_loss < best_val:
-            best_val = val_loss
+        if val_mae < best_val:
+            best_val = val_mae
             best_state = model.state_dict()
             best_metrics = (val_mae, val_iou)
 
     if best_state is not None:
         model.load_state_dict(best_state)
         print(
-            f"[Load] best validation model: val_loss={best_val:.4f}, "
-            f"val_mae={best_metrics[0]:.2f}, val_iou={best_metrics[1]:.3f}"
+            f"[Load] best validation model: val_mae={best_metrics[0]:.2f}, "
+            f"val_iou={best_metrics[1]:.3f}"
         )
 
     C.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
