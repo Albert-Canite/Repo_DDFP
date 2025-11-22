@@ -88,10 +88,12 @@ class RegressionNet(nn.Module):
         self.convs = nn.ModuleList(
             [nn.Conv2d(1, 1, kernel_size=C.KERNEL_SIZE, bias=False) for _ in range(5)]
         )
+        self.pool = nn.AdaptiveAvgPool2d((8, 8))
+        pooled_feat = 8 * 8
+        coord_channels = 2  # x,y coordinate maps
+        self.head_in = pooled_feat * (1 + coord_channels)
         self.head = nn.Sequential(
-            nn.AdaptiveAvgPool2d((8, 8)),
-            nn.Flatten(),
-            nn.Linear(64, C.REGRESSION_HEAD_HIDDEN1),
+            nn.Linear(self.head_in, C.REGRESSION_HEAD_HIDDEN1),
             nn.ReLU(),
             nn.Linear(C.REGRESSION_HEAD_HIDDEN1, C.REGRESSION_HEAD_HIDDEN2),
             nn.ReLU(),
@@ -99,13 +101,31 @@ class RegressionNet(nn.Module):
             nn.Sigmoid(),
         )
 
+    def _append_coords(self, feat: torch.Tensor) -> torch.Tensor:
+        b, _, h, w = feat.shape
+        device, dtype = feat.device, feat.dtype
+        y_grid = torch.linspace(0.0, 1.0, steps=h, device=device, dtype=dtype).view(1, 1, h, 1).expand(b, 1, h, w)
+        x_grid = torch.linspace(0.0, 1.0, steps=w, device=device, dtype=dtype).view(1, 1, 1, w).expand(b, 1, h, w)
+        return torch.cat([feat, x_grid, y_grid], dim=1)
+
+    def _encode_features(self, feat: torch.Tensor) -> torch.Tensor:
+        pooled = self.pool(feat)
+        with_coords = self._append_coords(pooled)
+        return with_coords.flatten(1)
+
     def forward(self, x):
         if x.dim() == 5:
             x = x.squeeze(1)
         for conv in self.convs:
             x = F.relu(conv(x))
-        out = self.head(x)
+        encoded = self._encode_features(x)
+        out = self.head(encoded)
         return out
+
+    def decode_from_features(self, feat: np.ndarray) -> torch.Tensor:
+        feat_t = torch.tensor(feat, dtype=torch.float32)
+        encoded = self._encode_features(feat_t)
+        return self.head(encoded)
 
     def feature_kernels(self):
         return [conv.weight.detach().cpu().numpy() for conv in self.convs]
@@ -474,9 +494,8 @@ def run_regression_flow():
         base_out, _, _ = run_network_baseline(img_np, apply_relu=True)
 
         for name, feat in [("DDFP", ddfp_out), ("BASE", base_out)]:
-            tensor_feat = torch.tensor(feat, dtype=torch.float32)
             with torch.no_grad():
-                pred = model.head(tensor_feat)
+                pred = model.decode_from_features(feat)
                 pred = order_and_clip_boxes(pred).squeeze(0).numpy() * C.IMAGE_SIZE
                 pred = sanitize_box(pred)
             if name == "DDFP":
