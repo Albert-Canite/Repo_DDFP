@@ -7,21 +7,22 @@ from core.utils import load_images_rsna, snr_db
 from ddfp.fp32_forward import run_network_fp32
 from ddfp.baseline_forward import run_network_baseline
 from ddfp.ddfp_forward import calibrate_ddfp, run_network_ddfp
+from experiments.rsna_regression import run_regression_flow
 
 
 def run_single_config(L, IN, W, ADC):
-    # 配置初始化
+    # Initialize configuration
     C.setup_config(L, IN, W, ADC)
 
-    # 加载校准和测试图像
+    # Load calibration and test images
     cal_imgs = load_images_rsna(C.NUM_CALIBRATION)
     test_imgs = load_images_rsna(C.NUM_TEST)
 
-    # 校准（得到 δ, α, β…）
+    # Calibrate (get δ, α, β…)
     calibrate_ddfp(cal_imgs)
 
     # ----------------------------
-    # 图像布局（与原始 Precision_multi 一致）
+    # Plot layout (matching original Precision_multi)
     # ----------------------------
     rows = C.NUM_TEST
     cols = 5
@@ -41,7 +42,7 @@ def run_single_config(L, IN, W, ADC):
     for idx, img in enumerate(test_imgs):
 
         # ----------------------------
-        # 原图
+        # Original image
         # ----------------------------
         if C.INPUT_SIGNED:
             orig_vis = img[0, 0] + 0.5
@@ -49,25 +50,25 @@ def run_single_config(L, IN, W, ADC):
             orig_vis = img[0, 0]
 
         # ----------------------------
-        # FP32 参考结果
+        # FP32 reference
         # ----------------------------
         ref = run_network_fp32(img, C.kernels)
         ref2d = ref[0, 0]
 
         # ----------------------------
-        # Baseline 结果
+        # Baseline result
         # ----------------------------
         base, _, _ = run_network_baseline(img)
         base2d = base[0, 0]
 
         # ----------------------------
-        # DDFP 结果（未校准）
+        # DDFP result (uncalibrated)
         # ----------------------------
         ddfp, _, _, _ = run_network_ddfp(img)
         ddfp_raw = ddfp[0, 0]
 
         # ==============================================================
-        # ① 全局输出校准（论文中的 1×1 校准层）
+        # ① Global output calibration (1×1 calibration layer)
         # ==============================================================
 
         ref_flat = ref2d.flatten()
@@ -84,7 +85,7 @@ def run_single_config(L, IN, W, ADC):
         ddfp2d = a * ddfp_raw
 
         # ==============================================================
-        # ② FP32 / Baseline / DDFP 使用相同 vmin/vmax
+        # ② FP32 / Baseline / DDFP share the same vmin/vmax
         # ==============================================================
 
         absmax = max(
@@ -95,13 +96,12 @@ def run_single_config(L, IN, W, ADC):
         if absmax < 1e-12:
             absmax = 1e-6
 
-        # 如果你想强制全部非负可改为 vmin=0
-        # 这里遵循 FP32 范围（可能正负）
+        # To force non-negative, set vmin=0; here we follow FP32 range which can be signed
         vmin = -absmax
         vmax = absmax
 
         # ==============================================================
-        # ③ 差分图（原版 ACIM 绘法）
+        # ③ Difference map (ACIM style)
         # ==============================================================
 
         diff = ddfp2d - base2d
@@ -110,7 +110,7 @@ def run_single_config(L, IN, W, ADC):
         thr = float(np.percentile(np.abs(diff), 98.0))
 
         # ==============================================================
-        # ④ 计算 SNR
+        # ④ Compute SNR
         # ==============================================================
 
         snr_d = snr_db(ref, ddfp)
@@ -120,7 +120,7 @@ def run_single_config(L, IN, W, ADC):
         imgs = [orig_vis, ref2d, ddfp2d, base2d, diff]
 
         # ----------------------------
-        # 绘五列子图
+        # Draw five-column subplots
         # ----------------------------
         for j in range(cols):
             ax = axes[idx, j]
@@ -128,7 +128,7 @@ def run_single_config(L, IN, W, ADC):
 
             if j == 1:  # FP32
                 im = ax.imshow(imgs[j], cmap=cmaps[j], vmin=vmin, vmax=vmax)
-            elif j == 2:  # DDFP (校准后)
+            elif j == 2:  # DDFP (calibrated)
                 im = ax.imshow(imgs[j], cmap=cmaps[j], vmin=vmin, vmax=vmax)
             elif j == 3:  # Baseline
                 im = ax.imshow(imgs[j], cmap=cmaps[j], vmin=vmin, vmax=vmax)
@@ -136,13 +136,13 @@ def run_single_config(L, IN, W, ADC):
                 im = ax.imshow(imgs[j], cmap=cmaps[j],
                                vmin=-vlim_diff, vmax=vlim_diff)
                 ax.contour(imgs[j], levels=[thr], colors=["yellow"], linewidths=0.7)
-            else:  # 原图
+            else:  # Original
                 im = ax.imshow(imgs[j], cmap=cmaps[j])
 
             ax.axis("off")
             fig.colorbar(im, ax=ax, fraction=0.045, pad=0.03)
 
-            # 添加 SNR 文本（仅 DDFP / Baseline）
+            # Add SNR text (only for DDFP / Baseline)
             if j == 2:
                 ax.text(
                     0.02, 0.05,
@@ -179,13 +179,19 @@ def run_single_config(L, IN, W, ADC):
 
 
 if __name__ == "__main__":
-    configs = list(itertools.product(
-        C.NUM_LAYERS_LIST,
-        C.INPUT_BITS_LIST,
-        C.WEIGHT_BITS_LIST,
-        C.ADC_BITS_LIST
-    ))
+    if C.TASK_TYPE == "simple":
+        configs = list(itertools.product(
+            C.NUM_LAYERS_LIST,
+            C.INPUT_BITS_LIST,
+            C.WEIGHT_BITS_LIST,
+            C.ADC_BITS_LIST
+        ))
 
-    for (L, IN, W, ADC) in configs:
-        print(f"\n=== Running Config: L={L} IN={IN} W={W} ADC={ADC} ===")
-        run_single_config(L, IN, W, ADC)
+        for (L, IN, W, ADC) in configs:
+            print(f"\n=== Running Config: L={L} IN={IN} W={W} ADC={ADC} ===")
+            run_single_config(L, IN, W, ADC)
+    elif C.TASK_TYPE == "rsna_regression":
+        print("[Task] Running RSNA bbox regression + DDFP comparison")
+        run_regression_flow()
+    else:
+        raise ValueError(f"Unknown TASK_TYPE: {C.TASK_TYPE}")
