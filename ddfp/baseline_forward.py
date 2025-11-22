@@ -21,7 +21,7 @@ def acim_hw(mac_output, adc_scale, gain, adc_noise):
     return adc_q.astype(np.int32)
 
 
-def run_network_baseline(x_fp):
+def run_network_baseline(x_fp, apply_relu: bool = False):
     x_int = np.rint(x_fp / C.DELTA_BASELINE).clip(C.INPUT_MIN, C.INPUT_MAX).astype(np.int32)
 
     adc_usage_full = []
@@ -41,6 +41,8 @@ def run_network_baseline(x_fp):
 
         noise = get_noise_pack(layer_idx, out_int.shape)
         out_adc = acim_hw(out_int, C.BASELINE_ADC_SCALE, noise["gain"], noise["adc_noise"])
+        if apply_relu:
+            out_adc = np.maximum(out_adc, 0)
 
         u_full, u_eff, _ = _adc_utilization_stats(out_adc)
         adc_usage_full.append(u_full)
@@ -50,5 +52,7 @@ def run_network_baseline(x_fp):
 
     composite_scale = C.DELTA_BASELINE * ((C.WEIGHT_SCALE_BASELINE * C.BASELINE_ADC_SCALE) ** C.NUM_LAYERS)
     out_fp = x_int.astype(np.float32) * composite_scale
+    if apply_relu:
+        out_fp = np.maximum(out_fp, 0.0)
 
     return out_fp, adc_usage_full, adc_usage_eff

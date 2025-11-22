@@ -20,7 +20,7 @@ from ddfp.fp32_forward import run_network_fp32
 @dataclass
 class BBoxItem:
     pid: str
-    box: Tuple[float, float, float, float]
+    box: Tuple[float, float, float, float]  # raw pixel (x, y, w, h) in original image size
 
 
 class RSNABBoxDataset(Dataset):
@@ -34,8 +34,12 @@ class RSNABBoxDataset(Dataset):
     def __getitem__(self, idx):
         item = self.items[idx]
         img_path = C.RSNA_TRAIN_IMG_DIR / f"{item.pid}.dcm"
-        img = load_dicom_image(img_path)
-        box = torch.tensor(item.box, dtype=torch.float32)
+        img, orig_shape = load_dicom_image(img_path, return_shape=True)
+        h0, w0 = orig_shape
+        x, y, w, h = item.box
+        box = torch.tensor(
+            [x / w0, y / h0, (x + w) / w0, (y + h) / h0], dtype=torch.float32
+        )
 
         if self.augment:
             if np.random.rand() < 0.5:
@@ -51,7 +55,7 @@ class RSNABBoxDataset(Dataset):
 
 def load_bbox_items(limit=None):
     if not C.RSNA_LABEL_CSV.exists():
-        raise FileNotFoundError(f"未找到标签文件: {C.RSNA_LABEL_CSV}")
+        raise FileNotFoundError(f"Label file not found: {C.RSNA_LABEL_CSV}")
 
     items = []
     seen = set()
@@ -67,23 +71,17 @@ def load_bbox_items(limit=None):
             y = float(row["y"])
             w = float(row["width"])
             h = float(row["height"])
-            box = (
-                x / C.IMAGE_SIZE,
-                y / C.IMAGE_SIZE,
-                (x + w) / C.IMAGE_SIZE,
-                (y + h) / C.IMAGE_SIZE,
-            )
-            items.append(BBoxItem(pid=pid, box=box))
+            items.append(BBoxItem(pid=pid, box=(x, y, w, h)))
             seen.add(pid)
             if limit is not None and len(items) >= limit:
                 break
     if not items:
-        raise RuntimeError("未能加载任何正样本 bbox")
+        raise RuntimeError("No positive bbox samples were loaded")
     return items
 
 
 class RegressionNet(nn.Module):
-    """单通道 CNN，匹配 RSNA 灰度输入与 DDFP/Baseline 的单通道卷积接口。"""
+    """Single-channel CNN compatible with RSNA grayscale input and DDFP/Baseline convolution."""
 
     def __init__(self):
         super().__init__()
@@ -230,7 +228,7 @@ def train_regression_model(train_set, val_set):
     if best_state is not None:
         model.load_state_dict(best_state)
         print(
-            f"[Load] 使用最优验证模型: val_loss={best_val:.4f}, "
+            f"[Load] best validation model: val_loss={best_val:.4f}, "
             f"val_mae={best_metrics[0]:.2f}, val_iou={best_metrics[1]:.3f}"
         )
 
@@ -245,18 +243,19 @@ def load_or_train_model(train_set, val_set):
     if C.REGRESSION_CKPT.exists():
         try:
             model.load_state_dict(torch.load(C.REGRESSION_CKPT, map_location="cpu"))
-            print(f"[Load] 使用已有模型 {C.REGRESSION_CKPT}")
+            print(f"[Load] using existing model {C.REGRESSION_CKPT}")
             return model
         except RuntimeError as err:
             backup = C.REGRESSION_CKPT.with_suffix(".ckpt.incompatible")
             try:
                 C.REGRESSION_CKPT.rename(backup)
                 print(
-                    f"[Load] 检测到旧权重不兼容，已备份到 {backup}，改为重新训练。错误: {err}"
+                    f"[Load] incompatible checkpoint detected, backed up to {backup}, retraining. Error: {err}"
                 )
             except OSError:
                 print(
-                    f"[Load] 检测到旧权重不兼容（{err}），无法自动备份，请手动删除 {C.REGRESSION_CKPT} 后重试。"
+                    f"[Load] incompatible checkpoint detected ({err}); cannot back up automatically. "
+                    f"Please delete {C.REGRESSION_CKPT} and retry."
                 )
     return train_regression_model(train_set, val_set)
 
@@ -306,14 +305,14 @@ def plot_training_history(history):
     axes[0].plot(epochs, val_loss, label="val_loss")
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("Loss")
-    axes[0].set_title("Loss 曲线")
+    axes[0].set_title("Loss curves")
     axes[0].legend()
 
     axes[1].plot(epochs, val_mae, label="val_mae")
     axes[1].plot(epochs, val_iou, label="val_iou")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Metric")
-    axes[1].set_title("验证指标曲线")
+    axes[1].set_title("Validation metrics")
     axes[1].legend()
 
     plt.tight_layout()
@@ -331,7 +330,7 @@ def run_regression_flow():
     C.setup_config(len(kernels), C.INPUT_BITS_LIST[0], C.WEIGHT_BITS_LIST[0], C.ADC_BITS_LIST[0])
     C.set_kernels(kernels)
 
-    calibrate_ddfp(calib_imgs)
+    calibrate_ddfp(calib_imgs, apply_relu=True)
 
     fp_preds, ddfp_preds, base_preds, gts = [], [], [], []
     snr_records = []
@@ -345,9 +344,9 @@ def run_regression_flow():
         fp_preds.append(sanitize_box(fp_out))
         gts.append(sanitize_box(gt * C.IMAGE_SIZE))
 
-        feat_fp32 = run_network_fp32(img_np, C.kernels)
-        ddfp_out, _, _, _ = run_network_ddfp(img_np)
-        base_out, _, _ = run_network_baseline(img_np)
+        feat_fp32 = run_network_fp32(img_np, C.kernels, apply_relu=True)
+        ddfp_out, _, _, _ = run_network_ddfp(img_np, apply_relu=True)
+        base_out, _, _ = run_network_baseline(img_np, apply_relu=True)
 
         for name, feat in [("DDFP", ddfp_out), ("BASE", base_out)]:
             tensor_feat = torch.tensor(feat, dtype=torch.float32)
@@ -376,7 +375,16 @@ def run_regression_flow():
         f"Baseline mae={mae_base:.2f} iou={iou_base:.3f}"
     )
 
-    save_regression_fig(test_set, fp_preds, ddfp_preds, base_preds, gts)
+    save_regression_fig(
+        test_set,
+        fp_preds,
+        ddfp_preds,
+        base_preds,
+        gts,
+        (mae_fp, iou_fp),
+        (mae_ddfp, iou_ddfp),
+        (mae_base, iou_base),
+    )
 
 
 def draw_box(ax, box, color, label):
@@ -388,7 +396,16 @@ def draw_box(ax, box, color, label):
     ax.text(x1, y1, label, color=color, fontsize=8)
 
 
-def save_regression_fig(test_set, fp_preds, ddfp_preds, base_preds, gts):
+def save_regression_fig(
+    test_set,
+    fp_preds,
+    ddfp_preds,
+    base_preds,
+    gts,
+    fp_metrics,
+    ddfp_metrics,
+    base_metrics,
+):
     rows = min(3, len(test_set))
     fig, axes = plt.subplots(rows, 3, figsize=(12, 4 * rows))
     if rows == 1:
@@ -398,9 +415,9 @@ def save_regression_fig(test_set, fp_preds, ddfp_preds, base_preds, gts):
         img, _ = test_set[idx]
         img_vis = img.squeeze().numpy()
         for col, (preds, title, color) in enumerate([
-            (fp_preds, "FP32 标注", "green"),
-            (ddfp_preds, "DDFP 标注", "red"),
-            (base_preds, "Baseline 标注", "blue"),
+            (fp_preds, "FP32 annotation", "green"),
+            (ddfp_preds, "DDFP annotation", "red"),
+            (base_preds, "Baseline annotation", "blue"),
         ]):
             ax = axes[idx, col]
             ax.imshow(img_vis, cmap="gray")
@@ -410,10 +427,21 @@ def save_regression_fig(test_set, fp_preds, ddfp_preds, base_preds, gts):
             ax.set_title(title)
 
     plt.tight_layout()
+    fig.text(
+        0.5,
+        0.02,
+        (
+            f"FP32: MAE={fp_metrics[0]:.2f}, IoU={fp_metrics[1]:.3f} | "
+            f"DDFP: MAE={ddfp_metrics[0]:.2f}, IoU={ddfp_metrics[1]:.3f} | "
+            f"Baseline: MAE={base_metrics[0]:.2f}, IoU={base_metrics[1]:.3f}"
+        ),
+        ha="center",
+        fontsize=10,
+    )
     fig.savefig(C.REGRESSION_OUTPUT_IMG, dpi=150)
     print(f"[Saved] {C.REGRESSION_OUTPUT_IMG}")
 
 
 if __name__ == "__main__":
-    print("[Task] RSNA bbox regression + DDFP 对比")
+    print("[Task] RSNA bbox regression + DDFP comparison")
     run_regression_flow()
