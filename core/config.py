@@ -22,7 +22,7 @@ NUM_TEST = 2
 KERNEL_SIZE = 4
 
 # 任务选择："simple" 为原有卷积测试，"rsna_regression" 为 RSNA 小型回归网络
-TASK_TYPE = "rsna_regression"
+TASK_TYPE = "simple"
 
 NUM_LAYERS_LIST = [1]
 INPUT_BITS_LIST = [5]

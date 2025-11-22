@@ -166,10 +166,13 @@ def train_regression_model(train_set, val_set):
     model = RegressionNet()
     opt = torch.optim.Adam(model.parameters(), lr=C.RSNA_LR, weight_decay=C.RSNA_WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, factor=0.3, patience=4, verbose=True, min_lr=1e-5
+        opt, factor=0.3, patience=4, verbose=False, min_lr=1e-5
     )
     loss_fn = nn.SmoothL1Loss()
     history = []
+    best_state = None
+    best_val = float("inf")
+    best_metrics = (float("inf"), 0.0)
 
     for epoch in range(C.RSNA_EPOCHS):
         model.train()
@@ -218,6 +221,18 @@ def train_regression_model(train_set, val_set):
         )
 
         scheduler.step(val_loss)
+
+        if val_loss < best_val:
+            best_val = val_loss
+            best_state = model.state_dict()
+            best_metrics = (val_mae, val_iou)
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        print(
+            f"[Load] 使用最优验证模型: val_loss={best_val:.4f}, "
+            f"val_mae={best_metrics[0]:.2f}, val_iou={best_metrics[1]:.3f}"
+        )
 
     C.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), C.REGRESSION_CKPT)
