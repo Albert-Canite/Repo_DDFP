@@ -4,8 +4,15 @@ import os
 from pathlib import Path
 
 YOLO_ROOT = Path(__file__).resolve().parents[1]
-RSNA_DIR = YOLO_ROOT / "rsna-pneumonia-detection-challenge"
+OUTPUT_DIR = YOLO_ROOT / "outputs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Dataset path priority: env var > user local default > repo copy
+_rsna_env = os.environ.get("RSNA_DIR")
+_rsna_default = Path(r"E:\OneDrive - KAUST\ONN codes\yolo\rsna-pneumonia-detection-challenge")
+RSNA_DIR = Path(_rsna_env) if _rsna_env else (_rsna_default if _rsna_default.exists() else YOLO_ROOT / "rsna-pneumonia-detection-challenge")
 RSNA_TRAIN_IMG_DIR = RSNA_DIR / "stage_2_train_images"
+RSNA_TEST_IMG_DIR = RSNA_DIR / "stage_2_test_images"  # Official test set is unlabeled; use for inference only
 
 
 IMAGE_SIZE = 512
@@ -14,10 +21,29 @@ NUM_CALIBRATION = 50
 NUM_TEST = 2
 KERNEL_SIZE = 4
 
+# Task selector: "simple" keeps the original kernel test; "rsna_regression" runs the RSNA regression network
+TASK_TYPE = "simple"
+
 NUM_LAYERS_LIST = [1]
 INPUT_BITS_LIST = [5]
 WEIGHT_BITS_LIST = [5]
 ADC_BITS_LIST = [8]
+
+# RSNA regression settings
+RSNA_LABEL_CSV = RSNA_DIR / "stage_2_train_labels.csv"
+RSNA_TRAIN_SAMPLES = 2000
+RSNA_VAL_SAMPLES = 400
+RSNA_BATCH_SIZE = 16
+RSNA_EPOCHS = 60
+RSNA_LR = 1e-3
+RSNA_WEIGHT_DECAY = 5e-4
+REGRESSION_HEAD_HIDDEN1 = 256
+REGRESSION_HEAD_HIDDEN2 = 128
+REGRESSION_OUTPUT_IMG = OUTPUT_DIR / "rsna_regression_comparison.png"
+REGRESSION_FP32_IMG = OUTPUT_DIR / "rsna_regression_fp32.png"
+REGRESSION_FP32_TRACKING = OUTPUT_DIR / "rsna_regression_fp32_tracking.csv"
+REGRESSION_TRAIN_CURVE = OUTPUT_DIR / "rsna_regression_training.png"
+REGRESSION_CKPT = OUTPUT_DIR / "rsna_regression.ckpt"
 
 WEIGHT_SIGNED = True
 ADC_SIGNED = True
@@ -33,10 +59,6 @@ DELTA_PERCENTILE = 98
 DELTA_MARGIN = 1.0
 BETA_ALIGN_ITERS = 3
 BETA_ALIGN_CLIP = (0.85, 1.15)
-
-OUTPUT_DIR = YOLO_ROOT / "outputs"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
 
 SEED = 2025
 rng = np.random.default_rng(SEED)
@@ -75,7 +97,7 @@ P_SYMS = []
 
 def setup_config(num_layers, input_bits, weight_bits, adc_bits):
     """
-    初始化 bit 数、量化范围、baseline scale、kernel 随机初始化等。
+    Initialize bit widths, quantization ranges, baseline scale, and kernel initialization.
     """
 
     global NUM_LAYERS, INPUT_BITS, WEIGHT_BITS, ADC_BITS
@@ -91,7 +113,7 @@ def setup_config(num_layers, input_bits, weight_bits, adc_bits):
     WEIGHT_BITS = int(weight_bits)
     ADC_BITS = int(adc_bits)
 
-    # 动态范围
+    # Dynamic ranges
     INPUT_MAX = 2**(INPUT_BITS-1)-1 if INPUT_SIGNED else 2**INPUT_BITS-1
     INPUT_MIN = -2**(INPUT_BITS-1) if INPUT_SIGNED else 0
 
@@ -113,13 +135,21 @@ def setup_config(num_layers, input_bits, weight_bits, adc_bits):
     BASELINE_ADC_SCALE_FP32 = THEORETICAL_MAC_MAX / (ADC_MAX * ADC_EFF)
     BASELINE_ADC_SCALE = fp32_to_fp15(BASELINE_ADC_SCALE_FP32)
 
-    # 随机初始化 kernels
+    # Randomly initialize kernels
     kernels = generate_kernels(NUM_LAYERS, KERNEL_SIZE)
 
-    # 清空噪声库
+    # Reset noise banks
     _noise_bank = {}
     _w_noise_bank = {}
 
     print(f"\n===== Setup Done: L={NUM_LAYERS}, IN={INPUT_BITS}, W={WEIGHT_BITS}, ADC={ADC_BITS} =====")
     print(f"RSNA DIR = {RSNA_DIR}")
     print(f"ImageSize = {IMAGE_SIZE}")
+
+
+def set_kernels(custom_kernels):
+    """Override default random kernels (used for regression model conv weights)."""
+    global kernels, _noise_bank, _w_noise_bank
+    kernels = custom_kernels
+    _noise_bank = {}
+    _w_noise_bank = {}

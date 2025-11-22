@@ -1,6 +1,7 @@
 import numpy as np
 from pathlib import Path
 import pydicom
+from pydicom.pixel_data_handlers.util import apply_modality_lut, apply_voi_lut
 import cv2
 import torch
 import torch.nn.functional as F
@@ -13,33 +14,40 @@ from core.config import (
 )
 
 
-def load_dicom_image(path):
+def load_dicom_image(path, return_shape: bool = False):
     dcm = pydicom.dcmread(path)
-    img = dcm.pixel_array.astype(np.float32)
+    orig_shape = dcm.pixel_array.shape  # (H, W)
 
-    maxv = img.max()
-    if maxv == 0:
-        maxv = 1.0
-    img = img / maxv
+    img = apply_modality_lut(dcm.pixel_array, dcm).astype(np.float32)
+    if hasattr(dcm, "WindowCenter") and hasattr(dcm, "WindowWidth"):
+        img = apply_voi_lut(img, dcm)
+    else:
+        center, width = -600.0, 1500.0
+        img = np.clip(img, center - width / 2, center + width / 2)
 
+    vmin, vmax = img.min(), img.max()
+    img = (img - vmin) / (vmax - vmin + 1e-8)
     if INPUT_SIGNED:
         img = img - 0.5
 
     img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_AREA)
 
-    return img[None, None]
+    img = img[None, None]
+    if return_shape:
+        return img, orig_shape
+    return img
 
 
 def load_images_rsna(num):
     if not RSNA_TRAIN_IMG_DIR.exists():
         raise FileNotFoundError(
-            f"错误：RSNA_TRAIN_IMG_DIR 路径不存在: {RSNA_TRAIN_IMG_DIR}"
+            f"RSNA_TRAIN_IMG_DIR path does not exist: {RSNA_TRAIN_IMG_DIR}"
         )
 
     files = list(RSNA_TRAIN_IMG_DIR.glob("*.dcm"))
     if len(files) == 0:
         raise FileNotFoundError(
-            f"错误：没有 DICOM 图像: {RSNA_TRAIN_IMG_DIR}"
+            f"No DICOM images found under: {RSNA_TRAIN_IMG_DIR}"
         )
 
     sel = rng.choice(files, size=min(num, len(files)), replace=False)
