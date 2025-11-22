@@ -14,8 +14,9 @@ from core.config import (
 )
 
 
-def load_dicom_image(path):
+def load_dicom_image(path, return_shape: bool = False):
     dcm = pydicom.dcmread(path)
+    orig_shape = dcm.pixel_array.shape  # (H, W)
 
     img = apply_modality_lut(dcm.pixel_array, dcm).astype(np.float32)
     if hasattr(dcm, "WindowCenter") and hasattr(dcm, "WindowWidth"):
@@ -31,19 +32,22 @@ def load_dicom_image(path):
 
     img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_AREA)
 
-    return img[None, None]
+    img = img[None, None]
+    if return_shape:
+        return img, orig_shape
+    return img
 
 
 def load_images_rsna(num):
     if not RSNA_TRAIN_IMG_DIR.exists():
         raise FileNotFoundError(
-            f"错误：RSNA_TRAIN_IMG_DIR 路径不存在: {RSNA_TRAIN_IMG_DIR}"
+            f"RSNA_TRAIN_IMG_DIR path does not exist: {RSNA_TRAIN_IMG_DIR}"
         )
 
     files = list(RSNA_TRAIN_IMG_DIR.glob("*.dcm"))
     if len(files) == 0:
         raise FileNotFoundError(
-            f"错误：没有 DICOM 图像: {RSNA_TRAIN_IMG_DIR}"
+            f"No DICOM images found under: {RSNA_TRAIN_IMG_DIR}"
         )
 
     sel = rng.choice(files, size=min(num, len(files)), replace=False)

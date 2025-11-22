@@ -7,12 +7,12 @@ YOLO_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = YOLO_ROOT / "outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# 数据集路径优先读取环境变量，其次使用用户本地默认路径，最后回退到仓库目录下的副本
+# Dataset path priority: env var > user local default > repo copy
 _rsna_env = os.environ.get("RSNA_DIR")
 _rsna_default = Path(r"E:\OneDrive - KAUST\ONN codes\yolo\rsna-pneumonia-detection-challenge")
 RSNA_DIR = Path(_rsna_env) if _rsna_env else (_rsna_default if _rsna_default.exists() else YOLO_ROOT / "rsna-pneumonia-detection-challenge")
 RSNA_TRAIN_IMG_DIR = RSNA_DIR / "stage_2_train_images"
-RSNA_TEST_IMG_DIR = RSNA_DIR / "stage_2_test_images"  # 官方测试集无标签，可用于纯推理对比
+RSNA_TEST_IMG_DIR = RSNA_DIR / "stage_2_test_images"  # Official test set is unlabeled; use for inference only
 
 
 IMAGE_SIZE = 512
@@ -21,7 +21,7 @@ NUM_CALIBRATION = 50
 NUM_TEST = 2
 KERNEL_SIZE = 4
 
-# 任务选择："simple" 为原有卷积测试，"rsna_regression" 为 RSNA 小型回归网络
+# Task selector: "simple" keeps the original kernel test; "rsna_regression" runs the RSNA regression network
 TASK_TYPE = "simple"
 
 NUM_LAYERS_LIST = [1]
@@ -29,7 +29,7 @@ INPUT_BITS_LIST = [5]
 WEIGHT_BITS_LIST = [5]
 ADC_BITS_LIST = [8]
 
-# RSNA 回归任务设置
+# RSNA regression settings
 RSNA_LABEL_CSV = RSNA_DIR / "stage_2_train_labels.csv"
 RSNA_TRAIN_SAMPLES = 2000
 RSNA_VAL_SAMPLES = 400
@@ -95,7 +95,7 @@ P_SYMS = []
 
 def setup_config(num_layers, input_bits, weight_bits, adc_bits):
     """
-    初始化 bit 数、量化范围、baseline scale、kernel 随机初始化等。
+    Initialize bit widths, quantization ranges, baseline scale, and kernel initialization.
     """
 
     global NUM_LAYERS, INPUT_BITS, WEIGHT_BITS, ADC_BITS
@@ -111,7 +111,7 @@ def setup_config(num_layers, input_bits, weight_bits, adc_bits):
     WEIGHT_BITS = int(weight_bits)
     ADC_BITS = int(adc_bits)
 
-    # 动态范围
+    # Dynamic ranges
     INPUT_MAX = 2**(INPUT_BITS-1)-1 if INPUT_SIGNED else 2**INPUT_BITS-1
     INPUT_MIN = -2**(INPUT_BITS-1) if INPUT_SIGNED else 0
 
@@ -133,10 +133,10 @@ def setup_config(num_layers, input_bits, weight_bits, adc_bits):
     BASELINE_ADC_SCALE_FP32 = THEORETICAL_MAC_MAX / (ADC_MAX * ADC_EFF)
     BASELINE_ADC_SCALE = fp32_to_fp15(BASELINE_ADC_SCALE_FP32)
 
-    # 随机初始化 kernels
+    # Randomly initialize kernels
     kernels = generate_kernels(NUM_LAYERS, KERNEL_SIZE)
 
-    # 清空噪声库
+    # Reset noise banks
     _noise_bank = {}
     _w_noise_bank = {}
 
@@ -146,7 +146,7 @@ def setup_config(num_layers, input_bits, weight_bits, adc_bits):
 
 
 def set_kernels(custom_kernels):
-    """覆盖默认的随机 kernels（用于回归模型 conv 权重）。"""
+    """Override default random kernels (used for regression model conv weights)."""
     global kernels, _noise_bank, _w_noise_bank
     kernels = custom_kernels
     _noise_bank = {}
