@@ -23,7 +23,7 @@ def acim_hw(mac_output, adc_scale, gain, adc_noise):
     return adc_q.astype(np.int32)
 
 
-def calibrate_ddfp(cal_imgs):
+def calibrate_ddfp(cal_imgs, apply_relu: bool = False):
     deltas, alphas, betas_scale, betas_gain, p_syms = [], [], [], [], []
     x_cur = [img.copy() for img in cal_imgs]
     target_util_full = C.ADC_EFF / C.BETA_MARGIN
@@ -44,7 +44,7 @@ def calibrate_ddfp(cal_imgs):
 
         alpha = search_alpha_min_mse(kernel)
 
-        # MAC 分布
+        # MAC distribution for percentile estimation
         mac_vals = []
         for x in x_cur:
             x_int = np.rint(x / delta).clip(C.INPUT_MIN, C.INPUT_MAX).astype(np.int32)
@@ -63,7 +63,7 @@ def calibrate_ddfp(cal_imgs):
 
         beta_scale = (p_sym * C.BETA_MARGIN) / (C.ADC_MAX * C.ADC_EFF)  # MAC/LSB
 
-        # beta 对齐迭代
+        # Beta alignment iterations
         for _ in range(C.BETA_ALIGN_ITERS):
             util_meas = []
             for idx_img, x in enumerate(x_cur, 1):
@@ -107,7 +107,7 @@ def calibrate_ddfp(cal_imgs):
         betas_gain.append(float(beta_gain))
         p_syms.append(float(p_sym))
 
-        # 前向传播更新 x_cur
+        # Forward propagate to update x_cur
         x_next = []
         for x in x_cur:
             x_int = np.rint(x / delta).clip(C.INPUT_MIN, C.INPUT_MAX).astype(np.int32)
@@ -124,6 +124,8 @@ def calibrate_ddfp(cal_imgs):
             noise = get_noise_pack(layer_idx, mac_map.shape)
             out_adc = acim_hw(mac_map, betas_scale[-1], noise["gain"], noise["adc_noise"])
             out_fp = out_adc.astype(np.float32) * float(delta) * float(alpha) * float(betas_scale[-1])
+            if apply_relu:
+                out_fp = np.maximum(out_fp, 0.0)
             x_next.append(out_fp[np.newaxis, np.newaxis, :, :])
 
         x_cur = x_next
@@ -137,7 +139,7 @@ def calibrate_ddfp(cal_imgs):
     return deltas, alphas, betas_scale, betas_gain, p_syms
 
 
-def run_network_ddfp(x_fp):
+def run_network_ddfp(x_fp, apply_relu: bool = False):
     out = x_fp
     adc_usage_full = []
     adc_usage_eff = []
@@ -170,6 +172,8 @@ def run_network_ddfp(x_fp):
         adc_usage_eff.append(u_eff)
 
         out = out_adc.astype(np.float32) * float(delta) * float(alpha) * float(beta_scale)
+        if apply_relu:
+            out = np.maximum(out, 0.0)
         out = out[np.newaxis, np.newaxis, :, :]
 
     return out, adc_usage_full, adc_usage_eff, per_layer_params
