@@ -179,9 +179,13 @@ def train_regression_model(train_set, val_set):
         for imgs, targets in train_loader:
             opt.zero_grad()
             preds = model(imgs)
+            preds = order_and_clip_boxes(preds)
+            targets = order_and_clip_boxes(targets)
             preds_pix = preds * C.IMAGE_SIZE
             targets_pix = targets * C.IMAGE_SIZE
-            loss = loss_fn(preds_pix, targets_pix)
+            loss_l1 = loss_fn(preds_pix, targets_pix)
+            loss_iou = 1.0 - bbox_iou_tensor(preds_pix, targets_pix)
+            loss = loss_l1 + C.BBOX_IOU_LOSS_WEIGHT * loss_iou
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
@@ -194,9 +198,14 @@ def train_regression_model(train_set, val_set):
         with torch.no_grad():
             for imgs, targets in val_loader:
                 preds = model(imgs)
+                preds = order_and_clip_boxes(preds)
+                targets = order_and_clip_boxes(targets)
                 preds_pix = preds * C.IMAGE_SIZE
                 targets_pix = targets * C.IMAGE_SIZE
-                val_loss += loss_fn(preds_pix, targets_pix).item() * imgs.size(0)
+                loss_l1 = loss_fn(preds_pix, targets_pix)
+                loss_iou = 1.0 - bbox_iou_tensor(preds_pix, targets_pix)
+                batch_loss = (loss_l1 + C.BBOX_IOU_LOSS_WEIGHT * loss_iou).item()
+                val_loss += batch_loss * imgs.size(0)
                 val_preds.append(preds_pix.detach().cpu().numpy())
                 val_targets.append(targets_pix.detach().cpu().numpy())
         val_loss = val_loss / max(len(val_loader.dataset), 1)
@@ -266,6 +275,33 @@ def load_or_train_model(train_set, val_set):
     return train_regression_model(train_set, val_set)
 
 
+def order_and_clip_boxes(boxes: torch.Tensor) -> torch.Tensor:
+    x1 = torch.minimum(boxes[:, 0], boxes[:, 2])
+    x2 = torch.maximum(boxes[:, 0], boxes[:, 2])
+    y1 = torch.minimum(boxes[:, 1], boxes[:, 3])
+    y2 = torch.maximum(boxes[:, 1], boxes[:, 3])
+    ordered = torch.stack([x1, y1, x2, y2], dim=1)
+    return ordered.clamp(0.0, 1.0)
+
+
+def bbox_iou_tensor(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    px1, py1, px2, py2 = preds[:, 0], preds[:, 1], preds[:, 2], preds[:, 3]
+    tx1, ty1, tx2, ty2 = targets[:, 0], targets[:, 1], targets[:, 2], targets[:, 3]
+
+    ix1 = torch.maximum(px1, tx1)
+    iy1 = torch.maximum(py1, ty1)
+    ix2 = torch.minimum(px2, tx2)
+    iy2 = torch.minimum(py2, ty2)
+
+    inter = torch.clamp(ix2 - ix1, min=0) * torch.clamp(iy2 - iy1, min=0)
+    area_p = torch.clamp(px2 - px1, min=0) * torch.clamp(py2 - py1, min=0)
+    area_t = torch.clamp(tx2 - tx1, min=0) * torch.clamp(ty2 - ty1, min=0)
+    union = area_p + area_t - inter + 1e-8
+
+    iou = inter / union
+    return iou.mean()
+
+
 def compute_metrics(preds, targets):
     preds = np.array([sanitize_box(p) for p in preds])
     targets = np.array([sanitize_box(t) for t in targets])
@@ -331,7 +367,8 @@ def evaluate_fp32(model, test_set):
     fp_preds, gts = [], []
     with torch.no_grad():
         for img, target in test_set:
-            fp_out = model(img.unsqueeze(0)).squeeze(0).numpy() * C.IMAGE_SIZE
+            fp_out = model(img.unsqueeze(0))
+            fp_out = order_and_clip_boxes(fp_out).squeeze(0).numpy() * C.IMAGE_SIZE
             fp_preds.append(sanitize_box(fp_out))
             gts.append(sanitize_box(target.numpy() * C.IMAGE_SIZE))
     mae_fp, iou_fp = compute_metrics(fp_preds, gts)
@@ -439,7 +476,8 @@ def run_regression_flow():
         for name, feat in [("DDFP", ddfp_out), ("BASE", base_out)]:
             tensor_feat = torch.tensor(feat, dtype=torch.float32)
             with torch.no_grad():
-                pred = model.head(tensor_feat).squeeze(0).numpy() * C.IMAGE_SIZE
+                pred = model.head(tensor_feat)
+                pred = order_and_clip_boxes(pred).squeeze(0).numpy() * C.IMAGE_SIZE
                 pred = sanitize_box(pred)
             if name == "DDFP":
                 ddfp_preds.append(pred)
