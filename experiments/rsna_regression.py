@@ -321,9 +321,96 @@ def plot_training_history(history):
     print(f"[Saved] {C.REGRESSION_TRAIN_CURVE}")
 
 
+def evaluate_fp32(model, test_set):
+    fp_preds, gts = [], []
+    with torch.no_grad():
+        for img, target in test_set:
+            fp_out = model(img.unsqueeze(0)).squeeze(0).numpy() * C.IMAGE_SIZE
+            fp_preds.append(sanitize_box(fp_out))
+            gts.append(sanitize_box(target.numpy() * C.IMAGE_SIZE))
+    mae_fp, iou_fp = compute_metrics(fp_preds, gts)
+    return fp_preds, gts, (mae_fp, iou_fp)
+
+
+def per_sample_metrics(pred, target):
+    pred_box = sanitize_box(pred)
+    target_box = sanitize_box(target)
+    mae = float(np.mean(np.abs(pred_box - target_box)))
+    px1, py1, px2, py2 = pred_box
+    tx1, ty1, tx2, ty2 = target_box
+    ix1, iy1 = max(px1, tx1), max(py1, ty1)
+    ix2, iy2 = min(px2, tx2), min(py2, ty2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    area_p = max(0.0, px2 - px1) * max(0.0, py2 - py1)
+    area_t = max(0.0, tx2 - tx1) * max(0.0, ty2 - ty1)
+    union = area_p + area_t - inter + 1e-8
+    iou = float(inter / union)
+    return mae, iou
+
+
+def save_fp32_tracking(test_set, fp_preds, gts, metrics):
+    C.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    with open(C.REGRESSION_FP32_TRACKING, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "patientId",
+                "gt_x1",
+                "gt_y1",
+                "gt_x2",
+                "gt_y2",
+                "pred_x1",
+                "pred_y1",
+                "pred_x2",
+                "pred_y2",
+                "mae",
+                "iou",
+            ]
+        )
+        for item, pred, gt in zip(test_set.items, fp_preds, gts):
+            mae, iou = per_sample_metrics(pred, gt)
+            writer.writerow([item.pid, *gt, *pred, mae, iou])
+    print(
+        f"[Saved] FP32 tracking {C.REGRESSION_FP32_TRACKING} (overall MAE={metrics[0]:.2f}, IoU={metrics[1]:.3f})"
+    )
+
+
+def save_fp32_fig(test_set, fp_preds, gts, fp_metrics):
+    rows = min(3, len(test_set))
+    fig, axes = plt.subplots(rows, 1, figsize=(4, 4 * rows))
+    if rows == 1:
+        axes = np.expand_dims(axes, 0)
+
+    for idx in range(rows):
+        img, _ = test_set[idx]
+        img_vis = img.squeeze().numpy()
+        ax = axes[idx]
+        ax.imshow(img_vis, cmap="gray")
+        draw_box(ax, gts[idx], "yellow", "GT")
+        draw_box(ax, fp_preds[idx], "green", "FP32")
+        ax.axis("off")
+        ax.set_title("FP32 annotation")
+
+    plt.tight_layout()
+    fig.text(
+        0.5,
+        0.02,
+        f"FP32 only: MAE={fp_metrics[0]:.2f}, IoU={fp_metrics[1]:.3f}",
+        ha="center",
+        fontsize=10,
+    )
+    fig.savefig(C.REGRESSION_FP32_IMG, dpi=150)
+    print(f"[Saved] {C.REGRESSION_FP32_IMG}")
+
+
 def run_regression_flow():
     train_set, val_set, calib_set, test_set = build_rsna_splits()
     model = load_or_train_model(train_set, val_set)
+
+    fp_preds, gts, fp_metrics = evaluate_fp32(model, test_set)
+    save_fp32_tracking(test_set, fp_preds, gts, fp_metrics)
+    save_fp32_fig(test_set, fp_preds, gts, fp_metrics)
+
     calib_imgs = [img.numpy() for img, _ in calib_set]
 
     kernels = [k for k in model.feature_kernels()]
@@ -332,17 +419,12 @@ def run_regression_flow():
 
     calibrate_ddfp(calib_imgs, apply_relu=True)
 
-    fp_preds, ddfp_preds, base_preds, gts = [], [], [], []
+    ddfp_preds, base_preds = [], []
     snr_records = []
 
     for img, target in test_set:
         img_np = img.numpy()
         gt = target.numpy()
-
-        with torch.no_grad():
-            fp_out = model(img.unsqueeze(0)).squeeze(0).numpy() * C.IMAGE_SIZE
-        fp_preds.append(sanitize_box(fp_out))
-        gts.append(sanitize_box(gt * C.IMAGE_SIZE))
 
         feat_fp32 = run_network_fp32(img_np, C.kernels, apply_relu=True)
         ddfp_out, _, _, _ = run_network_ddfp(img_np, apply_relu=True)
@@ -365,7 +447,7 @@ def run_regression_flow():
             )
         )
 
-    mae_fp, iou_fp = compute_metrics(fp_preds, gts)
+    mae_fp, iou_fp = fp_metrics
     mae_ddfp, iou_ddfp = compute_metrics(ddfp_preds, gts)
     mae_base, iou_base = compute_metrics(base_preds, gts)
 
@@ -390,7 +472,7 @@ def run_regression_flow():
 def draw_box(ax, box, color, label):
     x1, y1, x2, y2 = box
     rect = patches.Rectangle(
-        (x1, y1), x2 - x1, y2 - y1, linewidth=1.5, edgecolor=color, facecolor='none'
+        (x1, y1), x2 - x1, y2 - y1, linewidth=1.5, edgecolor=color, facecolor="none"
     )
     ax.add_patch(rect)
     ax.text(x1, y1, label, color=color, fontsize=8)
@@ -414,11 +496,13 @@ def save_regression_fig(
     for idx in range(rows):
         img, _ = test_set[idx]
         img_vis = img.squeeze().numpy()
-        for col, (preds, title, color) in enumerate([
-            (fp_preds, "FP32 annotation", "green"),
-            (ddfp_preds, "DDFP annotation", "red"),
-            (base_preds, "Baseline annotation", "blue"),
-        ]):
+        for col, (preds, title, color) in enumerate(
+            [
+                (fp_preds, "FP32 annotation", "green"),
+                (ddfp_preds, "DDFP annotation", "red"),
+                (base_preds, "Baseline annotation", "blue"),
+            ]
+        ):
             ax = axes[idx, col]
             ax.imshow(img_vis, cmap="gray")
             draw_box(ax, gts[idx], "yellow", "GT")
