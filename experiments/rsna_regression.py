@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 
 import core.config as C
 from core.utils import load_dicom_image, snr_db
@@ -24,8 +24,9 @@ class BBoxItem:
 
 
 class RSNABBoxDataset(Dataset):
-    def __init__(self, items: List[BBoxItem]):
+    def __init__(self, items: List[BBoxItem], augment: bool = False):
         self.items = items
+        self.augment = augment
 
     def __len__(self):
         return len(self.items)
@@ -34,8 +35,18 @@ class RSNABBoxDataset(Dataset):
         item = self.items[idx]
         img_path = C.RSNA_TRAIN_IMG_DIR / f"{item.pid}.dcm"
         img = load_dicom_image(img_path)
-        target = torch.tensor(item.box, dtype=torch.float32)
-        return torch.tensor(img, dtype=torch.float32), target
+        box = torch.tensor(item.box, dtype=torch.float32)
+
+        if self.augment:
+            if np.random.rand() < 0.5:
+                img = np.flip(img, axis=-1).copy()
+                x1, y1, x2, y2 = box
+                box = torch.tensor([1 - x2, y1, 1 - x1, y2], dtype=torch.float32)
+            if np.random.rand() < 0.3:
+                scale = np.random.uniform(0.9, 1.1)
+                img = np.clip(img * scale, -0.5 if C.INPUT_SIGNED else 0.0, 0.5 if C.INPUT_SIGNED else 1.0)
+
+        return torch.tensor(img, dtype=torch.float32), box
 
 
 def load_bbox_items(limit=None):
@@ -112,24 +123,40 @@ def build_rsna_splits():
 
     needed = C.RSNA_TRAIN_SAMPLES + C.RSNA_VAL_SAMPLES + C.NUM_CALIBRATION + C.NUM_TEST
     items = load_bbox_items(limit=needed)
-    dataset = RSNABBoxDataset(items)
-
-    train_size = min(C.RSNA_TRAIN_SAMPLES, len(dataset))
-    remaining = len(dataset) - train_size
-    val_size = min(C.RSNA_VAL_SAMPLES, remaining)
-    remaining -= val_size
-    calib_size = min(C.NUM_CALIBRATION, remaining)
-    remaining -= calib_size
-    test_size = min(C.NUM_TEST, max(remaining, 1))
 
     generator = torch.Generator().manual_seed(C.SEED)
-    splits = random_split(
-        dataset,
-        [train_size, val_size, calib_size, test_size],
-        generator=generator,
-    )
-    _cached_splits = splits
-    return splits
+    indices = torch.randperm(len(items), generator=generator).tolist()
+
+    train_items = [items[i] for i in indices[: C.RSNA_TRAIN_SAMPLES]]
+    val_items = [items[i] for i in indices[C.RSNA_TRAIN_SAMPLES : C.RSNA_TRAIN_SAMPLES + C.RSNA_VAL_SAMPLES]]
+    calib_items = [
+        items[i]
+        for i in indices[
+            C.RSNA_TRAIN_SAMPLES
+            + C.RSNA_VAL_SAMPLES : C.RSNA_TRAIN_SAMPLES
+            + C.RSNA_VAL_SAMPLES
+            + C.NUM_CALIBRATION
+        ]
+    ]
+    test_items = [
+        items[i]
+        for i in indices[
+            C.RSNA_TRAIN_SAMPLES
+            + C.RSNA_VAL_SAMPLES
+            + C.NUM_CALIBRATION : C.RSNA_TRAIN_SAMPLES
+            + C.RSNA_VAL_SAMPLES
+            + C.NUM_CALIBRATION
+            + C.NUM_TEST
+        ]
+    ]
+
+    train_set = RSNABBoxDataset(train_items, augment=True)
+    val_set = RSNABBoxDataset(val_items)
+    calib_set = RSNABBoxDataset(calib_items)
+    test_set = RSNABBoxDataset(test_items)
+
+    _cached_splits = (train_set, val_set, calib_set, test_set)
+    return _cached_splits
 
 
 def train_regression_model(train_set, val_set):
@@ -138,6 +165,9 @@ def train_regression_model(train_set, val_set):
 
     model = RegressionNet()
     opt = torch.optim.Adam(model.parameters(), lr=C.RSNA_LR, weight_decay=C.RSNA_WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, factor=0.3, patience=4, verbose=True, min_lr=1e-5
+    )
     loss_fn = nn.SmoothL1Loss()
     history = []
 
@@ -149,6 +179,7 @@ def train_regression_model(train_set, val_set):
             preds = model(imgs)
             loss = loss_fn(preds, targets)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             total_loss += loss.item() * imgs.size(0)
         avg_loss = total_loss / len(train_loader.dataset)
@@ -177,6 +208,7 @@ def train_regression_model(train_set, val_set):
                 "val_loss": val_loss,
                 "val_mae": val_mae,
                 "val_iou": val_iou,
+                "lr": opt.param_groups[0]["lr"],
             }
         )
 
@@ -184,6 +216,8 @@ def train_regression_model(train_set, val_set):
             f"[Train] epoch={epoch+1} loss={avg_loss:.4f} val_loss={val_loss:.4f} "
             f"val_mae={val_mae:.2f} val_iou={val_iou:.3f}"
         )
+
+        scheduler.step(val_loss)
 
     C.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), C.REGRESSION_CKPT)
@@ -194,9 +228,21 @@ def train_regression_model(train_set, val_set):
 def load_or_train_model(train_set, val_set):
     model = RegressionNet()
     if C.REGRESSION_CKPT.exists():
-        model.load_state_dict(torch.load(C.REGRESSION_CKPT, map_location="cpu"))
-        print(f"[Load] 使用已有模型 {C.REGRESSION_CKPT}")
-        return model
+        try:
+            model.load_state_dict(torch.load(C.REGRESSION_CKPT, map_location="cpu"))
+            print(f"[Load] 使用已有模型 {C.REGRESSION_CKPT}")
+            return model
+        except RuntimeError as err:
+            backup = C.REGRESSION_CKPT.with_suffix(".ckpt.incompatible")
+            try:
+                C.REGRESSION_CKPT.rename(backup)
+                print(
+                    f"[Load] 检测到旧权重不兼容，已备份到 {backup}，改为重新训练。错误: {err}"
+                )
+            except OSError:
+                print(
+                    f"[Load] 检测到旧权重不兼容（{err}），无法自动备份，请手动删除 {C.REGRESSION_CKPT} 后重试。"
+                )
     return train_regression_model(train_set, val_set)
 
 
