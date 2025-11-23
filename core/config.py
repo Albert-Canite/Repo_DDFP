@@ -25,6 +25,9 @@ CONV_CHANNELS = 1
 # Task selector: "simple" keeps the original kernel test; "rsna_regression" runs the RSNA regression network
 TASK_TYPE = "simple"
 
+# Task selector: "simple" keeps the original kernel test; "rsna_regression" runs the RSNA regression network
+TASK_TYPE = "simple"
+
 NUM_LAYERS_LIST = [1]
 INPUT_BITS_LIST = [5]
 WEIGHT_BITS_LIST = [5]
