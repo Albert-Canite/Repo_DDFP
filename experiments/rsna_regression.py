@@ -86,10 +86,19 @@ class RegressionNet(nn.Module):
     def __init__(self, center_prior=(0.5, 0.5), size_prior=(C.REGRESSION_SIZE_PRIOR, C.REGRESSION_SIZE_PRIOR)):
         super().__init__()
         self.convs = nn.ModuleList(
-            [nn.Conv2d(1, 1, kernel_size=C.KERNEL_SIZE, bias=False) for _ in range(5)]
+            [
+                nn.Conv2d(
+                    1 if idx == 0 else C.CONV_CHANNELS,
+                    C.CONV_CHANNELS,
+                    kernel_size=C.KERNEL_SIZE,
+                    padding=C.KERNEL_SIZE // 2,
+                    bias=True,
+                )
+                for idx in range(5)
+            ]
         )
         self.pool = nn.AdaptiveAvgPool2d((8, 8))
-        pooled_feat = 8 * 8
+        pooled_feat = 8 * 8 * C.CONV_CHANNELS
         coord_channels = 2  # x,y coordinate maps
         self.head_in = pooled_feat * (1 + coord_channels)
         self.head = nn.Sequential(

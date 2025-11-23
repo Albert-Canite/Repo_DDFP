@@ -20,6 +20,10 @@ INPUT_SIGNED = True
 NUM_CALIBRATION = 50
 NUM_TEST = 2
 KERNEL_SIZE = 4
+CONV_CHANNELS = 1
+
+# Task selector: "simple" keeps the original kernel test; "rsna_regression" runs the RSNA regression network
+TASK_TYPE = "simple"
 
 # Task selector: "simple" keeps the original kernel test; "rsna_regression" runs the RSNA regression network
 TASK_TYPE = "simple"
@@ -37,6 +41,7 @@ RSNA_BATCH_SIZE = 16
 RSNA_EPOCHS = 60
 RSNA_LR = 1e-3
 RSNA_WEIGHT_DECAY = 5e-4
+RSNA_MODEL_CHANNELS = 1
 REGRESSION_HEAD_HIDDEN1 = 256
 REGRESSION_HEAD_HIDDEN2 = 128
 BBOX_IOU_LOSS_WEIGHT = 1.0
