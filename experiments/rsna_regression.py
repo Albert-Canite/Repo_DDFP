@@ -83,7 +83,7 @@ def load_bbox_items(limit=None):
 class RegressionNet(nn.Module):
     """Single-channel CNN compatible with RSNA grayscale input and DDFP/Baseline convolution."""
 
-    def __init__(self):
+    def __init__(self, center_prior=(0.5, 0.5), size_prior=(C.REGRESSION_SIZE_PRIOR, C.REGRESSION_SIZE_PRIOR)):
         super().__init__()
         self.convs = nn.ModuleList(
             [nn.Conv2d(1, 1, kernel_size=C.KERNEL_SIZE, bias=False) for _ in range(5)]
@@ -98,8 +98,15 @@ class RegressionNet(nn.Module):
             nn.Linear(C.REGRESSION_HEAD_HIDDEN1, C.REGRESSION_HEAD_HIDDEN2),
             nn.ReLU(),
             nn.Linear(C.REGRESSION_HEAD_HIDDEN2, 4),
-            nn.Sigmoid(),
         )
+
+        with torch.no_grad():
+            cx, cy = center_prior
+            sw, sh = size_prior
+            prior = torch.tensor([cx, cy, sw, sh], dtype=torch.float32)
+            prior = prior.clamp(1e-4, 1 - 1e-4)
+            prior_logits = torch.logit(prior)
+            self.head[-1].bias.copy_(prior_logits)
 
     def _append_coords(self, feat: torch.Tensor) -> torch.Tensor:
         b, _, h, w = feat.shape
@@ -113,19 +120,35 @@ class RegressionNet(nn.Module):
         with_coords = self._append_coords(pooled)
         return with_coords.flatten(1)
 
-    def forward(self, x):
+    def _decode_raw(self, raw: torch.Tensor):
+        center = torch.sigmoid(raw[:, :2])
+        size = torch.sigmoid(raw[:, 2:]).clamp(min=1e-4)
+        half = 0.5 * size
+        x1y1 = center - half
+        x2y2 = center + half
+        boxes = torch.cat([x1y1, x2y2], dim=1)
+        return boxes, torch.cat([center, size], dim=1)
+
+    def _forward_internal(self, x):
         if x.dim() == 5:
             x = x.squeeze(1)
         for conv in self.convs:
             x = F.relu(conv(x))
         encoded = self._encode_features(x)
-        out = self.head(encoded)
-        return out
+        raw = self.head(encoded)
+        return self._decode_raw(raw)
+
+    def forward(self, x):
+        boxes, _ = self._forward_internal(x)
+        return boxes
+
+    def forward_with_aux(self, x):
+        return self._forward_internal(x)
 
     def decode_from_features(self, feat: np.ndarray) -> torch.Tensor:
         feat_t = torch.tensor(feat, dtype=torch.float32)
-        encoded = self._encode_features(feat_t)
-        return self.head(encoded)
+        boxes, _ = self._forward_internal(feat_t)
+        return boxes
 
     def feature_kernels(self):
         return [conv.weight.detach().cpu().numpy() for conv in self.convs]
@@ -177,16 +200,37 @@ def build_rsna_splits():
     return _cached_splits
 
 
-def train_regression_model(train_set, val_set):
+def compute_priors(train_items: List[BBoxItem]):
+    centers, sizes = [], []
+    for item in train_items:
+        img_path = C.RSNA_TRAIN_IMG_DIR / f"{item.pid}.dcm"
+        _, orig_shape = load_dicom_image(img_path, return_shape=True)
+        h0, w0 = orig_shape
+        x, y, w, h = item.box
+        x1 = np.clip(x / w0, 0.0, 1.0)
+        y1 = np.clip(y / h0, 0.0, 1.0)
+        x2 = np.clip((x + w) / w0, 0.0, 1.0)
+        y2 = np.clip((y + h) / h0, 0.0, 1.0)
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        sizes.append([x2 - x1, y2 - y1])
+        centers.append([cx, cy])
+    centers = np.array(centers)
+    sizes = np.array(sizes)
+    center_prior = centers.mean(axis=0).tolist()
+    size_prior = np.clip(sizes.mean(axis=0), 1e-3, 0.9).tolist()
+    return center_prior, size_prior
+
+
+def train_regression_model(train_set, val_set, priors):
     train_loader = DataLoader(train_set, batch_size=C.RSNA_BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=C.RSNA_BATCH_SIZE)
 
-    model = RegressionNet()
+    model = RegressionNet(center_prior=priors[0], size_prior=priors[1])
     opt = torch.optim.Adam(model.parameters(), lr=C.RSNA_LR, weight_decay=C.RSNA_WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, factor=0.3, patience=4, verbose=False, min_lr=1e-5
     )
-    # Align training objective with pixel-space MAE used for reporting
     loss_fn = nn.L1Loss()
     history = []
     best_state = None
@@ -198,14 +242,20 @@ def train_regression_model(train_set, val_set):
         total_loss = 0.0
         for imgs, targets in train_loader:
             opt.zero_grad()
-            preds = model(imgs)
-            preds = order_and_clip_boxes(preds)
+            boxes, center_sizes = model.forward_with_aux(imgs)
+            boxes = order_and_clip_boxes(boxes)
             targets = order_and_clip_boxes(targets)
-            preds_pix = preds * C.IMAGE_SIZE
+            targets_cs = boxes_to_center_size(targets)
+
+            boxes_pix = boxes * C.IMAGE_SIZE
             targets_pix = targets * C.IMAGE_SIZE
-            loss_l1 = loss_fn(preds_pix, targets_pix)
-            loss_iou = 1.0 - bbox_iou_tensor(preds_pix, targets_pix)
-            loss = loss_l1 + C.BBOX_IOU_LOSS_WEIGHT * loss_iou
+            cs_pix = center_sizes * C.IMAGE_SIZE
+            targets_cs_pix = targets_cs * C.IMAGE_SIZE
+
+            loss_cs = loss_fn(cs_pix, targets_cs_pix)
+            loss_corner = loss_fn(boxes_pix, targets_pix)
+            loss_iou = 1.0 - bbox_iou_tensor(boxes_pix, targets_pix)
+            loss = loss_cs + 0.5 * loss_corner + C.BBOX_IOU_LOSS_WEIGHT * loss_iou
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
@@ -217,10 +267,10 @@ def train_regression_model(train_set, val_set):
         val_preds, val_targets = [], []
         with torch.no_grad():
             for imgs, targets in val_loader:
-                preds = model(imgs)
-                preds = order_and_clip_boxes(preds)
+                boxes, _ = model.forward_with_aux(imgs)
+                boxes = order_and_clip_boxes(boxes)
                 targets = order_and_clip_boxes(targets)
-                preds_pix = preds * C.IMAGE_SIZE
+                preds_pix = boxes * C.IMAGE_SIZE
                 targets_pix = targets * C.IMAGE_SIZE
                 loss_l1 = loss_fn(preds_pix, targets_pix)
                 loss_iou = 1.0 - bbox_iou_tensor(preds_pix, targets_pix)
@@ -273,8 +323,8 @@ def train_regression_model(train_set, val_set):
     return model
 
 
-def load_or_train_model(train_set, val_set):
-    model = RegressionNet()
+def load_or_train_model(train_set, val_set, priors):
+    model = RegressionNet(center_prior=priors[0], size_prior=priors[1])
     if C.REGRESSION_CKPT.exists():
         try:
             model.load_state_dict(torch.load(C.REGRESSION_CKPT, map_location="cpu"))
@@ -292,7 +342,16 @@ def load_or_train_model(train_set, val_set):
                     f"[Load] incompatible checkpoint detected ({err}); cannot back up automatically. "
                     f"Please delete {C.REGRESSION_CKPT} and retry."
                 )
-    return train_regression_model(train_set, val_set)
+    return train_regression_model(train_set, val_set, priors)
+
+
+def boxes_to_center_size(boxes: torch.Tensor) -> torch.Tensor:
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    center_x = 0.5 * (x1 + x2)
+    center_y = 0.5 * (y1 + y2)
+    w = torch.clamp(x2 - x1, min=1e-6)
+    h = torch.clamp(y2 - y1, min=1e-6)
+    return torch.stack([center_x, center_y, w, h], dim=1)
 
 
 def order_and_clip_boxes(boxes: torch.Tensor) -> torch.Tensor:
@@ -468,7 +527,9 @@ def save_fp32_fig(test_set, fp_preds, gts, fp_metrics):
 
 def run_regression_flow():
     train_set, val_set, calib_set, test_set = build_rsna_splits()
-    model = load_or_train_model(train_set, val_set)
+    priors = compute_priors(train_set.items)
+    print(f"[Prior] center={priors[0]}, size={priors[1]}")
+    model = load_or_train_model(train_set, val_set, priors)
 
     fp_preds, gts, fp_metrics = evaluate_fp32(model, test_set)
     save_fp32_tracking(test_set, fp_preds, gts, fp_metrics)
