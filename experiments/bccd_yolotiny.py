@@ -593,20 +593,38 @@ def train_epoch(model, loader, optimizer, scheduler, device, anchors, loss_fn):
         boxes = boxes.to(device)
         labels = labels.to(device)
         optimizer.zero_grad()
-        preds = model(imgs)
-        grid = preds.shape[-1]
+        raw = model(imgs)
+        grid = raw.shape[-1]
         targets = build_targets(boxes, labels, anchors, grid, len(C.BCCD_CLASSES))
-        preds = preds.view(imgs.size(0), len(anchors), 5 + len(C.BCCD_CLASSES), grid, grid).permute(0, 1, 3, 4, 2)
+
+        raw = raw.view(
+            imgs.size(0), len(anchors), 5 + len(C.BCCD_CLASSES), grid, grid
+        ).permute(0, 1, 3, 4, 2)
+
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(grid, device=device), torch.arange(grid, device=device), indexing="ij"
+        )
+        anchor_w = torch.tensor([a[0] for a in anchors], device=device).view(1, len(anchors), 1, 1)
+        anchor_h = torch.tensor([a[1] for a in anchors], device=device).view(1, len(anchors), 1, 1)
+
+        pred_xy = torch.sigmoid(raw[..., 0:2])
+        pred_wh = torch.exp(raw[..., 2:4])
+        pred_obj = raw[..., 4:5]
+        pred_cls = raw[..., 5:]
+
+        bx = (pred_xy[..., 0] + grid_x) / grid
+        by = (pred_xy[..., 1] + grid_y) / grid
+        bw = (pred_wh[..., 0] * anchor_w) / C.IMAGE_SIZE
+        bh = (pred_wh[..., 1] * anchor_h) / C.IMAGE_SIZE
+        pred_boxes = torch.stack([bx, by, bw, bh], dim=-1)
+
+        preds = torch.cat([pred_boxes, pred_obj, pred_cls], dim=-1)
         loss, detail = loss_fn(preds, targets)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
         scheduler.step()
         total_loss += loss.item() * imgs.size(0)
-        if step % max(1, C.BCCD_LOG_INTERVAL) == 0:
-            print(
-                f"[Train] step {step}/{len(loader)} loss={loss.item():.4f} ciou={detail['ciou']:.4f}"
-            )
         logs.append(detail)
     avg_loss = total_loss / len(loader.dataset)
     return avg_loss, logs
@@ -630,19 +648,37 @@ def evaluate(model, loader, device, anchors):
 def compute_metrics(preds, gts):
     total_iou, total_mae, total = 0.0, 0.0, 0
     for (pb, pl), (gb, gl) in zip(preds, gts):
+        valid_mask = (gl >= 0) & (gb.sum(dim=1) > 0)
+        gb = gb[valid_mask]
+        gl = gl[valid_mask]
         if gb.numel() == 0:
             continue
         total += 1
         if pb.numel() == 0:
             continue
-        ious = []
-        maes = []
-        for pbox in pb:
-            iou = box_iou_single(pbox, gb[0])
-            ious.append(iou)
-            maes.append(torch.abs(pbox - gb[0]).mean())
-        total_iou += float(torch.tensor(ious).mean()) if ious else 0.0
-        total_mae += float(torch.tensor(maes).mean()) if maes else 0.0
+
+        # Greedy match highest IoU pairs
+        remaining_preds = list(range(pb.shape[0]))
+        matched = []
+        for gt_idx in range(gb.shape[0]):
+            best_iou = -1
+            best_pred = None
+            for pi in remaining_preds:
+                iou = float(box_iou_single(pb[pi], gb[gt_idx]))
+                if iou > best_iou:
+                    best_iou = iou
+                    best_pred = pi
+            if best_pred is not None:
+                matched.append((pb[best_pred], gb[gt_idx]))
+                remaining_preds.remove(best_pred)
+
+        if not matched:
+            continue
+
+        ious = [box_iou_single(p, g) for p, g in matched]
+        maes = [torch.abs(p - g).mean() for p, g in matched]
+        total_iou += float(torch.stack(ious).mean())
+        total_mae += float(torch.stack(maes).mean())
     if total == 0:
         return 0.0, 0.0
     return total_mae / total, total_iou / total
@@ -736,7 +772,6 @@ def save_checkpoint(model, optimizer, scheduler, epoch, best=False):
     }
     path = C.BCCD_BEST_CKPT if best else C.BCCD_CKPT
     torch.save(ckpt, path)
-    print(f"[Checkpoint] saved to {path}")
 
 
 def load_checkpoint(model, optimizer=None, scheduler=None):
@@ -783,7 +818,6 @@ def run_training():
 
     step_counter = 0
     for epoch in range(start_epoch, C.BCCD_EPOCHS):
-        print(f"[Epoch {epoch+1}/{C.BCCD_EPOCHS}] starting")
         train_loss, logs = train_epoch(model, train_loader, optimizer, scheduler, device, anchors, loss_fn)
         val_mae, val_iou = evaluate(model, val_loader, device, anchors)
         history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": train_loss, "mae": val_mae, "iou": val_iou})
