@@ -559,6 +559,29 @@ def collate_fn(batch):
     return torch.stack(imgs, 0), torch.stack(padded_boxes, 0), torch.stack(padded_labels, 0)
 
 
+def _kmeans_anchors(box_wh: np.ndarray, k: int = 3, iters: int = 25) -> List[Tuple[int, int]]:
+    """Simple k-means on width/height (in pixels) to adapt anchors to dataset scale."""
+    if box_wh.shape[0] < k:
+        return [(12, 12), (24, 24), (36, 36)]
+    # initialize centers by random pick
+    centers = box_wh[np.random.choice(box_wh.shape[0], k, replace=False)]
+    for _ in range(iters):
+        dists = np.linalg.norm(box_wh[:, None, :] - centers[None, :, :], axis=-1)
+        assign = np.argmin(dists, axis=1)
+        new_centers = []
+        for i in range(k):
+            cluster = box_wh[assign == i]
+            if len(cluster) == 0:
+                new_centers.append(centers[i])
+            else:
+                new_centers.append(cluster.mean(axis=0))
+        new_centers = np.stack(new_centers)
+        if np.allclose(new_centers, centers, atol=1e-3):
+            break
+        centers = new_centers
+    return [(float(c[0]), float(c[1])) for c in centers]
+
+
 def visualize_samples(dataset: Dataset, path: Path, max_samples: int = 4):
     path.parent.mkdir(parents=True, exist_ok=True)
     cols = min(max_samples, 2)
@@ -645,6 +668,44 @@ def evaluate(model, loader, device, anchors):
     return compute_metrics(preds_all, gts_all)
 
 
+def evaluate_loss(model, loader, device, anchors, loss_fn):
+    model.eval()
+    total_loss = 0.0
+    with torch.no_grad():
+        for imgs, boxes, labels in loader:
+            imgs = imgs.to(device)
+            boxes = boxes.to(device)
+            labels = labels.to(device)
+            raw = model(imgs)
+            grid = raw.shape[-1]
+            targets = build_targets(boxes, labels, anchors, grid, len(C.BCCD_CLASSES))
+
+            raw = raw.view(
+                imgs.size(0), len(anchors), 5 + len(C.BCCD_CLASSES), grid, grid
+            ).permute(0, 1, 3, 4, 2)
+
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(grid, device=device), torch.arange(grid, device=device), indexing="ij"
+            )
+            anchor_w = torch.tensor([a[0] for a in anchors], device=device).view(1, len(anchors), 1, 1)
+            anchor_h = torch.tensor([a[1] for a in anchors], device=device).view(1, len(anchors), 1, 1)
+
+            pred_xy = torch.sigmoid(raw[..., 0:2])
+            pred_wh = torch.exp(raw[..., 2:4])
+            pred_obj = raw[..., 4:5]
+            pred_cls = raw[..., 5:]
+
+            bx = (pred_xy[..., 0] + grid_x) / grid
+            by = (pred_xy[..., 1] + grid_y) / grid
+            bw = (pred_wh[..., 0] * anchor_w) / C.IMAGE_SIZE
+            bh = (pred_wh[..., 1] * anchor_h) / C.IMAGE_SIZE
+            pred_boxes = torch.stack([bx, by, bw, bh], dim=-1)
+            preds = torch.cat([pred_boxes, pred_obj, pred_cls], dim=-1)
+            loss, _ = loss_fn(preds, targets)
+            total_loss += loss.item() * imgs.size(0)
+    return total_loss / len(loader.dataset)
+
+
 def compute_metrics(preds, gts):
     total_iou, total_mae, total = 0.0, 0.0, 0
     for (pb, pl), (gb, gl) in zip(preds, gts):
@@ -724,6 +785,15 @@ def prepare_dataloaders():
         raise ValueError(
             f"No labeled samples found. Check annotation file names and class labels at {C.BCCD_ANNO_DIR} or {C.BCCD_ANNO_CSV}."
         )
+    # Anchor auto-fit using training split to avoid target/pred mismatch on BCCD scale
+    box_wh = []
+    for s in samples:
+        wh = (s.boxes[:, 2:] - s.boxes[:, :2])
+        box_wh.append(wh)
+    box_wh_all = np.concatenate(box_wh, axis=0) if box_wh else np.zeros((0, 2))
+    fitted_anchors = _kmeans_anchors(box_wh_all, k=len(C.BCCD_ANCHORS))
+    anchors = [(max(a[0], 4.0), max(a[1], 4.0)) for a in fitted_anchors]
+
     random.seed(C.BCCD_SEED)
     random.shuffle(samples)
     n_total = len(samples)
@@ -760,7 +830,7 @@ def prepare_dataloaders():
         num_workers=0,
         collate_fn=collate_fn,
     )
-    return train_loader, val_loader, test_loader, train_set
+    return train_loader, val_loader, test_loader, train_set, anchors
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, best=False):
@@ -797,8 +867,9 @@ def export_for_quant(model: YoloTiny):
 
 def run_training():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_loader, val_loader, test_loader, train_set = prepare_dataloaders()
-    anchors = C.BCCD_ANCHORS
+    train_loader, val_loader, test_loader, train_set, anchors = prepare_dataloaders()
+    anchors = anchors if anchors else C.BCCD_ANCHORS
+    print(f"[Anchors] using: {anchors}")
     model = YoloTiny(len(C.BCCD_CLASSES), anchors).to(device)
     optimizer = torch.optim.SGD(
         model.parameters(),
@@ -807,7 +878,15 @@ def run_training():
         weight_decay=C.BCCD_WEIGHT_DECAY,
     )
     total_steps = C.BCCD_EPOCHS * max(1, len(train_loader))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=C.BCCD_MIN_LR)
+    warmup_steps = min(C.BCCD_WARMUP_ITERS, total_steps // 4)
+
+    def lr_lambda(step: int):
+        if step < warmup_steps:
+            return max(step / float(max(1, warmup_steps)), 1e-3)
+        progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     start_epoch = load_checkpoint(model, optimizer, scheduler)
     loss_fn = DetectionLoss(len(C.BCCD_CLASSES))
 
@@ -816,17 +895,16 @@ def run_training():
     if start_epoch == 0:
         visualize_samples(train_set, C.BCCD_VIS_DIR / "train_samples.png", max_samples=C.BCCD_PLOTS_SAMPLES)
 
-    step_counter = 0
     for epoch in range(start_epoch, C.BCCD_EPOCHS):
         train_loss, logs = train_epoch(model, train_loader, optimizer, scheduler, device, anchors, loss_fn)
+        val_loss = evaluate_loss(model, val_loader, device, anchors, loss_fn)
         val_mae, val_iou = evaluate(model, val_loader, device, anchors)
-        history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": train_loss, "mae": val_mae, "iou": val_iou})
+        history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss, "mae": val_mae, "iou": val_iou})
         save_checkpoint(model, optimizer, scheduler, epoch)
         if val_iou > best_iou:
             best_iou = val_iou
             save_checkpoint(model, optimizer, scheduler, epoch, best=True)
         print(f"[Epoch {epoch+1}] train_loss={train_loss:.4f} val_mae={val_mae:.4f} val_iou={val_iou:.4f}")
-        step_counter += len(train_loader)
     plot_curves(history, C.BCCD_TRAIN_CURVE, C.BCCD_METRIC_IMG)
 
     model.load_state_dict(torch.load(C.BCCD_BEST_CKPT, map_location=device)["model"])
