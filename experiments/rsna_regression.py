@@ -117,6 +117,18 @@ class RegressionNet(nn.Module):
             prior_logits = torch.logit(prior)
             self.head[-1].bias.copy_(prior_logits)
 
+        self._init_weights()
+
+    def _init_weights(self):
+        for conv in self.convs:
+            nn.init.kaiming_normal_(conv.weight, nonlinearity="relu")
+            if conv.bias is not None:
+                nn.init.zeros_(conv.bias)
+        for layer in self.head:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+                nn.init.zeros_(layer.bias)
+
     def _append_coords(self, feat: torch.Tensor) -> torch.Tensor:
         b, _, h, w = feat.shape
         device, dtype = feat.device, feat.dtype
@@ -232,10 +244,12 @@ def compute_priors(train_items: List[BBoxItem]):
 
 
 def train_regression_model(train_set, val_set, priors):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     train_loader = DataLoader(train_set, batch_size=C.RSNA_BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=C.RSNA_BATCH_SIZE)
 
-    model = RegressionNet(center_prior=priors[0], size_prior=priors[1])
+    model = RegressionNet(center_prior=priors[0], size_prior=priors[1]).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=C.RSNA_LR, weight_decay=C.RSNA_WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, factor=0.3, patience=4, verbose=False, min_lr=1e-5
@@ -250,6 +264,8 @@ def train_regression_model(train_set, val_set, priors):
         model.train()
         total_loss = 0.0
         for imgs, targets in train_loader:
+            imgs = imgs.to(device)
+            targets = targets.to(device)
             opt.zero_grad()
             boxes, center_sizes = model.forward_with_aux(imgs)
             boxes = order_and_clip_boxes(boxes)
@@ -276,6 +292,8 @@ def train_regression_model(train_set, val_set, priors):
         val_preds, val_targets = [], []
         with torch.no_grad():
             for imgs, targets in val_loader:
+                imgs = imgs.to(device)
+                targets = targets.to(device)
                 boxes, _ = model.forward_with_aux(imgs)
                 boxes = order_and_clip_boxes(boxes)
                 targets = order_and_clip_boxes(targets)
@@ -327,18 +345,21 @@ def train_regression_model(train_set, val_set, priors):
         )
 
     C.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), C.REGRESSION_CKPT)
+    model_cpu = model.to("cpu")
+    torch.save(model_cpu.state_dict(), C.REGRESSION_CKPT)
     plot_training_history(history)
-    return model
+    return model_cpu
 
 
 def load_or_train_model(train_set, val_set, priors):
-    model = RegressionNet(center_prior=priors[0], size_prior=priors[1])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = RegressionNet(center_prior=priors[0], size_prior=priors[1]).to(device)
     if C.REGRESSION_CKPT.exists():
         try:
-            model.load_state_dict(torch.load(C.REGRESSION_CKPT, map_location="cpu"))
+            state = torch.load(C.REGRESSION_CKPT, map_location="cpu")
+            model.load_state_dict(state)
             print(f"[Load] using existing model {C.REGRESSION_CKPT}")
-            return model
+            return model.cpu()
         except RuntimeError as err:
             backup = C.REGRESSION_CKPT.with_suffix(".ckpt.incompatible")
             try:
