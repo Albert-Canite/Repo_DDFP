@@ -1,3 +1,4 @@
+import csv
 import json
 import math
 import random
@@ -162,13 +163,102 @@ def _load_voc(anno_dir: Path) -> List[DetectionSample]:
     return samples
 
 
+def _load_csv(anno_path: Path) -> List[DetectionSample]:
+    if not anno_path.exists():
+        return []
+
+    samples: Dict[str, Dict[str, object]] = {}
+    cls_lookup = {c.lower(): i for i, c in enumerate(C.BCCD_CLASSES)}
+    with anno_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError(f"CSV annotation has no header: {anno_path}")
+        header_map = {name.lower(): name for name in reader.fieldnames}
+        def _find(keys: List[str]):
+            for k in keys:
+                if k in header_map:
+                    return header_map[k]
+            return None
+
+        fname_key = _find(["filename", "image", "img", "image_path", "path"])
+        label_key = _find(["class", "label", "category", "type"])
+        x1_key = _find(["xmin", "x1", "left"])
+        y1_key = _find(["ymin", "y1", "top"])
+        x2_key = _find(["xmax", "x2", "right"])
+        y2_key = _find(["ymax", "y2", "bottom"])
+        w_key = _find(["width", "img_width", "w"])
+        h_key = _find(["height", "img_height", "h"])
+
+        required = [fname_key, label_key, x1_key, y1_key, x2_key, y2_key]
+        if any(k is None for k in required):
+            raise ValueError(
+                f"CSV annotation missing required columns: have {reader.fieldnames}"
+            )
+
+        for row in reader:
+            fname = Path(row[fname_key]).name
+            cls_name = row[label_key].strip()
+            cls_key = cls_name.lower()
+            if cls_key not in cls_lookup:
+                continue
+            try:
+                box = [
+                    float(row[x1_key]),
+                    float(row[y1_key]),
+                    float(row[x2_key]),
+                    float(row[y2_key]),
+                ]
+            except ValueError:
+                continue
+            entry = samples.setdefault(fname, {"boxes": [], "labels": [], "size": (None, None)})
+            entry["boxes"].append(box)
+            entry["labels"].append(cls_lookup[cls_key])
+            if w_key and h_key and entry["size"] == (None, None):
+                try:
+                    entry["size"] = (int(float(row[w_key])), int(float(row[h_key])))
+                except ValueError:
+                    entry["size"] = (None, None)
+
+    output: List[DetectionSample] = []
+    for fname, data in samples.items():
+        img_path = C.BCCD_IMG_DIR / fname
+        if not img_path.exists():
+            print(f"[Warning] image not found for annotation: {img_path}")
+            continue
+        boxes = np.array(data["boxes"], dtype=np.float32)
+        labels = data["labels"]
+        w, h = data["size"]
+        if w is None or h is None:
+            img = plt.imread(img_path)
+            h, w = img.shape[:2]
+        output.append(
+            DetectionSample(
+                path=img_path,
+                boxes=boxes,
+                labels=labels,
+                size=(w, h),
+            )
+        )
+    return output
+
+
 def load_bccd_samples() -> List[DetectionSample]:
-    if not C.BCCD_ANNO_DIR.exists():
-        raise FileNotFoundError(f"Annotation directory missing: {C.BCCD_ANNO_DIR}")
-    coco_files = list(C.BCCD_ANNO_DIR.glob("*.json"))
-    if coco_files:
-        return _load_coco(coco_files[0])
-    return _load_voc(C.BCCD_ANNO_DIR)
+    # Priority: COCO JSON, VOC XML folder, CSV fallback
+    if C.BCCD_ANNO_DIR.exists() and C.BCCD_ANNO_DIR.is_dir():
+        coco_files = list(C.BCCD_ANNO_DIR.glob("*.json"))
+        if coco_files:
+            samples = _load_coco(coco_files[0])
+        else:
+            samples = _load_voc(C.BCCD_ANNO_DIR)
+        if samples:
+            return samples
+    if C.BCCD_ANNO_CSV.exists():
+        samples = _load_csv(C.BCCD_ANNO_CSV)
+        if samples:
+            return samples
+    raise FileNotFoundError(
+        f"No annotations found. Expected COCO/VOC under {C.BCCD_ANNO_DIR} or CSV at {C.BCCD_ANNO_CSV}."
+    )
 
 
 class StdConv(nn.Conv2d):
@@ -576,12 +666,21 @@ def plot_curves(history, path_loss: Path, path_metric: Path):
 
 def prepare_dataloaders():
     samples = load_bccd_samples()
+    if len(samples) == 0:
+        raise ValueError(
+            f"No labeled samples found. Check annotation file names and class labels at {C.BCCD_ANNO_DIR} or {C.BCCD_ANNO_CSV}."
+        )
     random.seed(C.BCCD_SEED)
     random.shuffle(samples)
     n_total = len(samples)
     n_val = int(n_total * C.BCCD_VAL_SPLIT)
     n_test = max(int(n_total * C.BCCD_TEST_SPLIT), C.NUM_TEST)
     n_train = n_total - n_val - n_test
+    if n_train <= 0:
+        raise ValueError(
+            f"Not enough samples for the requested splits (total={n_total}, val={n_val}, test={n_test}). "
+            "Reduce validation/test split ratios or ensure annotations are correctly parsed."
+        )
     train_set = BCCDDataset(samples[:n_train], augment=True)
     val_set = BCCDDataset(samples[n_train : n_train + n_val])
     test_set = BCCDDataset(samples[n_train + n_val :])

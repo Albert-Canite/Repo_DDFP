@@ -14,6 +14,7 @@ _bccd_default = Path(r"E:\\OneDrive - KAUST\\ONN codes\\yolo\\archive")
 BCCD_DIR = Path(_bccd_env) if _bccd_env else (_bccd_default if _bccd_default.exists() else YOLO_ROOT / "archive")
 BCCD_IMG_DIR = BCCD_DIR / "images"
 BCCD_ANNO_DIR = BCCD_DIR / "annotations"
+BCCD_ANNO_CSV = BCCD_DIR / "annotations.csv"
 
 # Image & loader settings
 IMAGE_SIZE = 512
