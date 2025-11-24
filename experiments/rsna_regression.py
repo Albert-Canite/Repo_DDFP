@@ -261,16 +261,25 @@ def train_regression_model(train_set, val_set, priors):
 
     model = RegressionNet(center_prior=priors[0], size_prior=priors[1]).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=C.RSNA_LR, weight_decay=C.RSNA_WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, factor=0.3, patience=4, min_lr=1e-5
+    warmup_epochs = max(int(C.RSNA_WARMUP_EPOCHS), 0)
+    cosine_epochs = max(C.RSNA_EPOCHS - warmup_epochs, 1)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=cosine_epochs, eta_min=C.RSNA_MIN_LR
     )
     loss_fn = nn.L1Loss()
     history = []
     best_state = None
     best_val = float("inf")
     best_metrics = (float("inf"), 0.0)
+    ema_val_mae = None
 
     for epoch in range(C.RSNA_EPOCHS):
+        if epoch < warmup_epochs:
+            warmup_factor = float(epoch + 1) / float(max(1, warmup_epochs))
+            target_lr = C.RSNA_LR * warmup_factor
+            for pg in opt.param_groups:
+                pg["lr"] = target_lr
+
         model.train()
         total_loss = 0.0
         for imgs, targets in train_loader:
@@ -323,6 +332,8 @@ def train_regression_model(train_set, val_set, priors):
         else:
             val_mae, val_iou = float("nan"), float("nan")
 
+        ema_val_mae = val_mae if ema_val_mae is None else 0.9 * ema_val_mae + 0.1 * val_mae
+
         history.append(
             {
                 "epoch": epoch + 1,
@@ -330,20 +341,21 @@ def train_regression_model(train_set, val_set, priors):
                 "val_loss": val_loss,
                 "val_mae": val_mae,
                 "val_iou": val_iou,
+                "ema_val_mae": ema_val_mae,
                 "lr": opt.param_groups[0]["lr"],
             }
         )
 
         print(
             f"[Train] epoch={epoch+1} loss={avg_loss:.4f} val_loss={val_loss:.4f} "
-            f"val_mae={val_mae:.2f} val_iou={val_iou:.3f}"
+            f"val_mae={val_mae:.2f} val_iou={val_iou:.3f} ema_val_mae={ema_val_mae:.2f}"
         )
 
-        # Drive learning-rate scheduling by validation MAE to match the target metric
-        scheduler.step(val_mae)
+        if epoch >= warmup_epochs:
+            scheduler.step()
 
-        if val_mae < best_val:
-            best_val = val_mae
+        if ema_val_mae < best_val:
+            best_val = ema_val_mae
             best_state = model.state_dict()
             best_metrics = (val_mae, val_iou)
 
