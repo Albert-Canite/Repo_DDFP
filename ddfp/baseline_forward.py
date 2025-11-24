@@ -40,12 +40,35 @@ def _conv2d_int(x_int, w_int, stride: int, padding: int):
     return out_int
 
 
-def run_network_baseline(x_fp, apply_relu: bool = False):
+def _apply_gn_activation(out_fp, meta):
+    if meta is None:
+        return out_fp
+    groups = meta.get("groups", 1)
+    eps = meta.get("eps", 1e-5)
+    weight = meta.get("weight")
+    bias = meta.get("bias")
+    if weight is not None and bias is not None:
+        N, C, H, W = out_fp.shape
+        x = out_fp.reshape(N, groups, C // groups, H, W)
+        mean = x.mean(axis=(2, 3, 4), keepdims=True)
+        var = x.var(axis=(2, 3, 4), keepdims=True)
+        x_norm = (x - mean) / np.sqrt(var + eps)
+        out_fp = x_norm.reshape(N, C, H, W)
+        out_fp = out_fp * weight.reshape(1, -1, 1, 1) + bias.reshape(1, -1, 1, 1)
+    if meta.get("activation", True):
+        out_fp = np.maximum(out_fp, 0) + 0.0
+        out_fp = out_fp / (1 + np.exp(-out_fp))  # SiLU approximation
+    return out_fp
+
+
+def run_network_baseline(x_fp, gn_meta=None):
     x_int = np.rint(x_fp / C.DELTA_BASELINE).clip(C.INPUT_MIN, C.INPUT_MAX).astype(np.int32)
 
     adc_usage_full = []
     adc_usage_eff = []
+    gn_meta = gn_meta or [None] * len(C.kernels)
 
+    out_fp = None
     for layer_idx, kernel in enumerate(C.kernels, 1):
         w_int = np.rint(kernel / C.WEIGHT_SCALE_BASELINE).clip(C.WEIGHT_MIN, C.WEIGHT_MAX).astype(np.int32)
         w_int = w_int * (1.0 + get_w_noise(layer_idx, w_int.shape))
@@ -56,18 +79,13 @@ def run_network_baseline(x_fp, apply_relu: bool = False):
 
         noise = get_noise_pack(layer_idx, out_int.shape)
         out_adc = acim_hw(out_int, C.BASELINE_ADC_SCALE, noise["gain"], noise["adc_noise"])
-        if apply_relu:
-            out_adc = np.maximum(out_adc, 0)
 
         u_full, u_eff, _ = _adc_utilization_stats(out_adc)
         adc_usage_full.append(u_full)
         adc_usage_eff.append(u_eff)
 
-        x_int = out_adc[np.newaxis, :, :, :]
-
-    composite_scale = C.DELTA_BASELINE * ((C.WEIGHT_SCALE_BASELINE * C.BASELINE_ADC_SCALE) ** C.NUM_LAYERS)
-    out_fp = x_int.astype(np.float32) * composite_scale
-    if apply_relu:
-        out_fp = np.maximum(out_fp, 0.0)
+        out_fp = out_adc.astype(np.float32) * float(C.DELTA_BASELINE) * float(C.WEIGHT_SCALE_BASELINE) * float(C.BASELINE_ADC_SCALE)
+        out_fp = _apply_gn_activation(out_fp[np.newaxis, :, :, :], gn_meta[layer_idx - 1])
+        x_int = np.rint(out_fp / C.DELTA_BASELINE).clip(C.INPUT_MIN, C.INPUT_MAX).astype(np.int32)
 
     return out_fp, adc_usage_full, adc_usage_eff
