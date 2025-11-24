@@ -43,6 +43,8 @@ RSNA_VAL_SAMPLES = 800
 # Use a conservative batch size to avoid CUDA OOM on 512x512 crops with the
 # wider regression backbone. Increase if your GPU has more memory available.
 RSNA_BATCH_SIZE = 8
+RSNA_NUM_WORKERS = 2  # DataLoader workers; raise on systems with more CPU headroom
+RSNA_LOG_INTERVAL = 20  # Print training loss every N steps for progress visibility
 RSNA_EPOCHS = 120
 RSNA_LR = 3e-3
 RSNA_MIN_LR = 3e-5

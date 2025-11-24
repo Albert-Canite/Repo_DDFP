@@ -308,8 +308,20 @@ def compute_priors(train_items: List[BBoxItem]):
 def train_regression_model(train_set, val_set, priors):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_loader = DataLoader(train_set, batch_size=C.RSNA_BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=C.RSNA_BATCH_SIZE)
+    pin_memory = device.type == "cuda"
+    train_loader = DataLoader(
+        train_set,
+        batch_size=C.RSNA_BATCH_SIZE,
+        shuffle=True,
+        num_workers=C.RSNA_NUM_WORKERS,
+        pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=C.RSNA_BATCH_SIZE,
+        num_workers=C.RSNA_NUM_WORKERS,
+        pin_memory=pin_memory,
+    )
 
     model = RegressionNet(center_prior=priors[0], size_prior=priors[1]).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=C.RSNA_LR, weight_decay=C.RSNA_WEIGHT_DECAY)
@@ -325,6 +337,9 @@ def train_regression_model(train_set, val_set, priors):
     best_metrics = (float("inf"), 0.0)
     ema_val_mae = None
 
+    steps_per_epoch = max(len(train_loader), 1)
+    log_every = max(int(C.RSNA_LOG_INTERVAL), 1)
+
     for epoch in range(C.RSNA_EPOCHS):
         if epoch < warmup_epochs:
             warmup_factor = float(epoch + 1) / float(max(1, warmup_epochs))
@@ -334,7 +349,12 @@ def train_regression_model(train_set, val_set, priors):
 
         model.train()
         total_loss = 0.0
-        for imgs, targets in train_loader:
+        print(
+            f"[Train] starting epoch {epoch+1}/{C.RSNA_EPOCHS} "
+            f"(batches={steps_per_epoch})",
+            flush=True,
+        )
+        for step_idx, (imgs, targets) in enumerate(train_loader, start=1):
             imgs = imgs.to(device)
             targets = targets.to(device)
             opt.zero_grad()
@@ -350,7 +370,20 @@ def train_regression_model(train_set, val_set, priors):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            total_loss += loss.item() * imgs.size(0)
+            batch_loss = loss.item()
+            total_loss += batch_loss * imgs.size(0)
+
+            if (
+                step_idx == 1
+                or step_idx % log_every == 0
+                or step_idx == steps_per_epoch
+            ):
+                print(
+                    f"[Train] epoch {epoch+1}/{C.RSNA_EPOCHS} "
+                    f"step {step_idx}/{steps_per_epoch} "
+                    f"loss={batch_loss:.4f}",
+                    flush=True,
+                )
         avg_loss = total_loss / len(train_loader.dataset)
 
         model.eval()
