@@ -2,6 +2,7 @@ import csv
 from dataclasses import dataclass
 from typing import List, Tuple
 
+import cv2
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
