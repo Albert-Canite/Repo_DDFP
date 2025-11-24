@@ -23,6 +23,25 @@ def acim_hw(mac_output, adc_scale, gain, adc_noise):
     return adc_q.astype(np.int32)
 
 
+def _conv2d_int(x_int, w_int, stride: int, padding: int):
+    K = w_int.shape[2]
+    if padding > 0:
+        x_int = np.pad(x_int, ((0, 0), (0, 0), (padding, padding), (padding, padding)), mode="constant")
+    H, W = x_int.shape[2:]
+    out_h = (H - K) // stride + 1
+    out_w = (W - K) // stride + 1
+    out_int = np.zeros((w_int.shape[0], out_h, out_w), dtype=np.float32)
+    for oc in range(w_int.shape[0]):
+        for ic in range(w_int.shape[1]):
+            for oh in range(out_h):
+                hs = oh * stride
+                for ow in range(out_w):
+                    ws = ow * stride
+                    patch = x_int[0, ic, hs : hs + K, ws : ws + K]
+                    out_int[oc, oh, ow] += np.sum(patch * w_int[oc, ic])
+    return out_int
+
+
 def calibrate_ddfp(cal_imgs, apply_relu: bool = False):
     deltas, alphas, betas_scale, betas_gain, p_syms = [], [], [], [], []
     x_cur = [img.copy() for img in cal_imgs]
@@ -46,16 +65,15 @@ def calibrate_ddfp(cal_imgs, apply_relu: bool = False):
 
         # MAC distribution for percentile estimation
         mac_vals = []
+        stride = C.KERNEL_STRIDES[layer_idx - 1] if layer_idx - 1 < len(C.KERNEL_STRIDES) else 1
+        padding = C.KERNEL_PADDINGS[layer_idx - 1] if layer_idx - 1 < len(C.KERNEL_PADDINGS) else 0
         for x in x_cur:
             x_int = np.rint(x / delta).clip(C.INPUT_MIN, C.INPUT_MAX).astype(np.int32)
-            w_int = np.rint(kernel / alpha).clip(C.WEIGHT_MIN, C.WEIGHT_MAX).astype(np.int32)[0, 0]
-            H, W = x_int.shape[2:]
-            for i in range(H - C.KERNEL_SIZE + 1):
-                for j in range(W - C.KERNEL_SIZE + 1):
-                    patch = x_int[0, 0, i:i + C.KERNEL_SIZE, j:j + C.KERNEL_SIZE]
-                    mac_vals.append(np.sum(patch * w_int))
+            w_int = np.rint(kernel / alpha).clip(C.WEIGHT_MIN, C.WEIGHT_MAX).astype(np.int32)
+            mac_map = _conv2d_int(x_int, w_int, stride=stride, padding=padding)
+            mac_vals.append(mac_map.flatten())
 
-        mac = np.array(mac_vals, dtype=np.float32)
+        mac = np.concatenate(mac_vals).astype(np.float32)
         mac_pos, mac_neg = mac[mac > 0], -mac[mac < 0]
         ppos = np.percentile(mac_pos, C.BETA_PERCENTILE) if mac_pos.size > 0 else 0.0
         pneg = np.percentile(mac_neg, C.BETA_PERCENTILE) if mac_neg.size > 0 else 0.0
@@ -68,14 +86,9 @@ def calibrate_ddfp(cal_imgs, apply_relu: bool = False):
             util_meas = []
             for idx_img, x in enumerate(x_cur, 1):
                 x_int = np.rint(x / delta).clip(C.INPUT_MIN, C.INPUT_MAX).astype(np.int32)
-                w_int = np.rint(kernel / alpha).clip(C.WEIGHT_MIN, C.WEIGHT_MAX).astype(np.int32)[0, 0]
+                w_int = np.rint(kernel / alpha).clip(C.WEIGHT_MIN, C.WEIGHT_MAX).astype(np.int32)
 
-                H, W = x_int.shape[2:]
-                mac_map = np.zeros((H - C.KERNEL_SIZE + 1, W - C.KERNEL_SIZE + 1), dtype=np.float32)
-                for i in range(mac_map.shape[0]):
-                    for j in range(mac_map.shape[1]):
-                        patch = x_int[0, 0, i:i + C.KERNEL_SIZE, j:j + C.KERNEL_SIZE]
-                        mac_map[i, j] = np.sum(patch * w_int)
+                mac_map = _conv2d_int(x_int, w_int, stride=stride, padding=padding)
 
                 noise = get_noise_pack(layer_idx, mac_map.shape)
                 out_adc = acim_hw(mac_map, beta_scale, noise["gain"], noise["adc_noise"])
@@ -111,22 +124,17 @@ def calibrate_ddfp(cal_imgs, apply_relu: bool = False):
         x_next = []
         for x in x_cur:
             x_int = np.rint(x / delta).clip(C.INPUT_MIN, C.INPUT_MAX).astype(np.int32)
-            w_int = np.rint(kernel / alpha).clip(C.WEIGHT_MIN, C.WEIGHT_MAX).astype(np.int32)[0, 0]
+            w_int = np.rint(kernel / alpha).clip(C.WEIGHT_MIN, C.WEIGHT_MAX).astype(np.int32)
             w_int = w_int * (1.0 + get_w_noise(layer_idx, w_int.shape))
 
-            H, W = x_int.shape[2:]
-            mac_map = np.zeros((H - C.KERNEL_SIZE + 1, W - C.KERNEL_SIZE + 1), dtype=np.float32)
-            for i in range(mac_map.shape[0]):
-                for j in range(mac_map.shape[1]):
-                    patch = x_int[0, 0, i:i + C.KERNEL_SIZE, j:j + C.KERNEL_SIZE]
-                    mac_map[i, j] = np.sum(patch * w_int)
+            mac_map = _conv2d_int(x_int, w_int, stride=stride, padding=padding)
 
             noise = get_noise_pack(layer_idx, mac_map.shape)
             out_adc = acim_hw(mac_map, betas_scale[-1], noise["gain"], noise["adc_noise"])
             out_fp = out_adc.astype(np.float32) * float(delta) * float(alpha) * float(betas_scale[-1])
             if apply_relu:
                 out_fp = np.maximum(out_fp, 0.0)
-            x_next.append(out_fp[np.newaxis, np.newaxis, :, :])
+            x_next.append(out_fp[np.newaxis, :, :, :])
 
         x_cur = x_next
 
@@ -155,15 +163,12 @@ def run_network_ddfp(x_fp, apply_relu: bool = False):
         per_layer_params.append((float(delta), float(alpha), float(beta_scale), float(beta_gain), float(p_sym)))
 
         x_int = np.rint(out / delta).clip(C.INPUT_MIN, C.INPUT_MAX).astype(np.int32)
-        w_int = np.rint(kernel / alpha).clip(C.WEIGHT_MIN, C.WEIGHT_MAX).astype(np.int32)[0, 0]
+        w_int = np.rint(kernel / alpha).clip(C.WEIGHT_MIN, C.WEIGHT_MAX).astype(np.int32)
         w_int = w_int * (1.0 + get_w_noise(layer_idx, w_int.shape))
 
-        H, W = x_int.shape[2:]
-        mac = np.zeros((H - C.KERNEL_SIZE + 1, W - C.KERNEL_SIZE + 1), dtype=np.float32)
-        for i in range(mac.shape[0]):
-            for j in range(mac.shape[1]):
-                patch = x_int[0, 0, i:i + C.KERNEL_SIZE, j:j + C.KERNEL_SIZE]
-                mac[i, j] = np.sum(patch * w_int)
+        stride = C.KERNEL_STRIDES[layer_idx - 1] if layer_idx - 1 < len(C.KERNEL_STRIDES) else 1
+        padding = C.KERNEL_PADDINGS[layer_idx - 1] if layer_idx - 1 < len(C.KERNEL_PADDINGS) else 0
+        mac = _conv2d_int(x_int, w_int, stride=stride, padding=padding)
 
         noise = get_noise_pack(layer_idx, mac.shape)
         out_adc = acim_hw(mac, beta_scale, noise["gain"], noise["adc_noise"])
@@ -174,6 +179,6 @@ def run_network_ddfp(x_fp, apply_relu: bool = False):
         out = out_adc.astype(np.float32) * float(delta) * float(alpha) * float(beta_scale)
         if apply_relu:
             out = np.maximum(out, 0.0)
-        out = out[np.newaxis, np.newaxis, :, :]
+        out = out[np.newaxis, :, :, :]
 
     return out, adc_usage_full, adc_usage_eff, per_layer_params

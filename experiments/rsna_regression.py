@@ -121,37 +121,24 @@ def load_bbox_items(limit=None):
 
 
 class RegressionNet(nn.Module):
-    """Single-channel CNN compatible with RSNA grayscale input and DDFP/Baseline convolution."""
+    """YOLO-tiny 风格的轻量化特征提取器 + 回归头。"""
 
-    def __init__(self, center_prior=(0.5, 0.5), size_prior=(C.REGRESSION_SIZE_PRIOR, C.REGRESSION_SIZE_PRIOR)):
+    def __init__(
+        self,
+        center_prior=(0.5, 0.5),
+        size_prior=(C.REGRESSION_SIZE_PRIOR, C.REGRESSION_SIZE_PRIOR),
+    ):
         super().__init__()
-        widths = [C.CONV_CHANNELS, C.CONV_CHANNELS, C.CONV_CHANNELS * 2, C.CONV_CHANNELS * 2, C.CONV_CHANNELS * 3, C.CONV_CHANNELS * 3]
-        convs = []
-        in_ch = 1
-        for out_ch in widths:
-            convs.append(self._make_block(in_ch, out_ch))
-            in_ch = out_ch
-        self.convs = nn.ModuleList(convs)
 
-        pool_out = 16
-        stride = C.IMAGE_SIZE // pool_out
-        if stride * pool_out != C.IMAGE_SIZE:
-            raise ValueError(
-                f"IMAGE_SIZE={C.IMAGE_SIZE} must be divisible by {pool_out} for deterministic pooling"
-            )
-        # AvgPool2d is deterministic on CUDA, unlike AdaptiveAvgPool2d backward
-        self.pool = nn.AvgPool2d(kernel_size=stride, stride=stride)
-        pooled_feat = pool_out * pool_out * widths[-1]
-        coord_channels = 2  # x,y coordinate maps
-        # After concatenating x/y coordinate channels, the feature width becomes
-        # (C.CONV_CHANNELS + coord_channels) * pool_out * pool_out. Use this exact
-        # dimension to keep the head input aligned with the encoder output.
-        self.head_in = pooled_feat + coord_channels * pool_out * pool_out
+        self.backbone, self.kernel_strides, self.kernel_paddings = self._build_backbone()
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        self.head_in = 256
         self.head = nn.Sequential(
             nn.Linear(self.head_in, C.REGRESSION_HEAD_HIDDEN1),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Linear(C.REGRESSION_HEAD_HIDDEN1, C.REGRESSION_HEAD_HIDDEN2),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Linear(C.REGRESSION_HEAD_HIDDEN2, 4),
         )
 
@@ -166,24 +153,59 @@ class RegressionNet(nn.Module):
         self._init_weights()
 
     @staticmethod
-    def _make_block(in_ch: int, out_ch: int) -> nn.Sequential:
+    def _conv_block(in_ch: int, out_ch: int, stride: int, ks: int = 3) -> nn.Sequential:
+        padding = ks // 2
         return nn.Sequential(
-            nn.Conv2d(
-                in_ch,
-                out_ch,
-                kernel_size=C.KERNEL_SIZE,
-                padding=C.KERNEL_SIZE // 2,
-                bias=False,
-            ),
+            nn.Conv2d(in_ch, out_ch, kernel_size=ks, stride=stride, padding=padding, bias=False),
             nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(0.1, inplace=True),
         )
 
+    def _build_backbone(self):
+        blocks = []
+        strides, paddings = [], []
+
+        cfg = [
+            (1, 16, 1),
+            (16, 32, 2),
+            (32, 32, 1),
+            (32, 64, 2),
+            (64, 64, 1),
+            (64, 128, 2),
+            (128, 128, 1),
+            (128, 256, 2),
+            (256, 256, 1),
+            (256, 512, 2),
+        ]
+
+        for in_ch, out_ch, stride in cfg:
+            block = self._conv_block(in_ch, out_ch, stride)
+            blocks.append(block)
+            strides.append(stride)
+            paddings.append(block[0].padding[0])
+
+        # channel squeeze + refinement
+        squeeze = nn.Conv2d(512, 256, kernel_size=1, stride=1, padding=0, bias=False)
+        squeeze_bn = nn.BatchNorm2d(256)
+        refine = nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1, bias=False)
+        refine_bn = nn.BatchNorm2d(256)
+
+        blocks.extend(
+            [
+                nn.Sequential(squeeze, squeeze_bn, nn.LeakyReLU(0.1, inplace=True)),
+                nn.Sequential(refine, refine_bn, nn.LeakyReLU(0.1, inplace=True)),
+            ]
+        )
+        strides.extend([1, 1])
+        paddings.extend([0, 1])
+
+        return nn.ModuleList(blocks), strides, paddings
+
     def _init_weights(self):
-        for block in self.convs:
+        for block in self.backbone:
             conv = block[0]
             bn = block[1]
-            nn.init.kaiming_normal_(conv.weight, nonlinearity="relu")
+            nn.init.kaiming_normal_(conv.weight, nonlinearity="leaky_relu")
             nn.init.ones_(bn.weight)
             nn.init.zeros_(bn.bias)
         for layer in self.head:
@@ -191,17 +213,9 @@ class RegressionNet(nn.Module):
                 nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
                 nn.init.zeros_(layer.bias)
 
-    def _append_coords(self, feat: torch.Tensor) -> torch.Tensor:
-        b, _, h, w = feat.shape
-        device, dtype = feat.device, feat.dtype
-        y_grid = torch.linspace(0.0, 1.0, steps=h, device=device, dtype=dtype).view(1, 1, h, 1).expand(b, 1, h, w)
-        x_grid = torch.linspace(0.0, 1.0, steps=w, device=device, dtype=dtype).view(1, 1, 1, w).expand(b, 1, h, w)
-        return torch.cat([feat, x_grid, y_grid], dim=1)
-
     def _encode_features(self, feat: torch.Tensor) -> torch.Tensor:
-        pooled = self.pool(feat)
-        with_coords = self._append_coords(pooled)
-        return with_coords.flatten(1)
+        pooled = self.global_pool(feat).flatten(1)
+        return pooled
 
     def _decode_raw(self, raw: torch.Tensor):
         center = torch.sigmoid(raw[:, :2])
@@ -215,7 +229,7 @@ class RegressionNet(nn.Module):
     def _forward_internal(self, x):
         if x.dim() == 5:
             x = x.squeeze(1)
-        for conv in self.convs:
+        for conv in self.backbone:
             x = conv(x)
         encoded = self._encode_features(x)
         raw = self.head(encoded)
@@ -230,11 +244,16 @@ class RegressionNet(nn.Module):
 
     def decode_from_features(self, feat: np.ndarray) -> torch.Tensor:
         feat_t = torch.tensor(feat, dtype=torch.float32, device=next(self.parameters()).device)
-        boxes, _ = self._forward_internal(feat_t)
+        encoded = self._encode_features(feat_t)
+        raw = self.head(encoded)
+        boxes, _ = self._decode_raw(raw)
         return boxes
 
     def feature_kernels(self):
-        return [conv.weight.detach().cpu().numpy() for conv in self.convs]
+        weights = []
+        for block in self.backbone:
+            weights.append(block[0].weight.detach().cpu().numpy())
+        return weights, list(self.kernel_strides), list(self.kernel_paddings)
 
 
 _cached_splits = None
@@ -670,9 +689,10 @@ def run_regression_flow():
 
     calib_imgs = [img.numpy() for img, _ in calib_set]
 
-    kernels = [k for k in model.feature_kernels()]
+    kernels, strides, paddings = model.feature_kernels()
     C.setup_config(len(kernels), C.INPUT_BITS_LIST[0], C.WEIGHT_BITS_LIST[0], C.ADC_BITS_LIST[0])
     C.set_kernels(kernels)
+    C.set_kernel_metadata(strides=strides, paddings=paddings)
 
     calibrate_ddfp(calib_imgs, apply_relu=True)
 

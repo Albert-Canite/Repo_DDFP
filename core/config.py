@@ -17,12 +17,14 @@ RSNA_TEST_IMG_DIR = RSNA_DIR / "stage_2_test_images"  # Official test set is unl
 
 IMAGE_SIZE = 512
 INPUT_SIGNED = True
-NUM_CALIBRATION = 50
+# Keep calibration/test subsets small to reduce turnaround on modest GPUs/CPUs
+# while still exercising the DDFP/Baseline comparison.
+NUM_CALIBRATION = 20
 NUM_TEST = 2
-KERNEL_SIZE = 4
+KERNEL_SIZE = 3
 
-# Convolutional backbone width for the RSNA regression model. A wider encoder
-# stabilizes training and gives the head richer features for bbox regression.
+# Convolutional backbone width for legacy paths (not used by the YOLO-tiny
+# regressor but retained for compatibility with older experiments).
 CONV_CHANNELS = 32
 
 # Task selector: "simple" keeps the original kernel test; "rsna_regression" runs the RSNA regression network
@@ -38,21 +40,21 @@ ADC_BITS_LIST = [8]
 
 # RSNA regression settings
 RSNA_LABEL_CSV = RSNA_DIR / "stage_2_train_labels.csv"
-RSNA_TRAIN_SAMPLES = 4000
-RSNA_VAL_SAMPLES = 800
-# Use a conservative batch size to avoid CUDA OOM on 512x512 crops with the
-# wider regression backbone. Increase if your GPU has more memory available.
-RSNA_BATCH_SIZE = 8
+RSNA_TRAIN_SAMPLES = 2000
+RSNA_VAL_SAMPLES = 400
+# Smaller batch size to accommodate the deeper YOLO-tiny style backbone on
+# 512x512 crops; increase cautiously if memory allows.
+RSNA_BATCH_SIZE = 4
 RSNA_NUM_WORKERS = 2  # DataLoader workers; raise on systems with more CPU headroom
 RSNA_LOG_INTERVAL = 20  # Print training loss every N steps for progress visibility
-RSNA_EPOCHS = 120
-RSNA_LR = 3e-3
-RSNA_MIN_LR = 3e-5
-RSNA_WARMUP_EPOCHS = 10
+RSNA_EPOCHS = 80
+RSNA_LR = 2e-3
+RSNA_MIN_LR = 2e-5
+RSNA_WARMUP_EPOCHS = 8
 RSNA_WEIGHT_DECAY = 1e-4
 RSNA_MODEL_CHANNELS = 1
-REGRESSION_HEAD_HIDDEN1 = 512
-REGRESSION_HEAD_HIDDEN2 = 256
+REGRESSION_HEAD_HIDDEN1 = 128
+REGRESSION_HEAD_HIDDEN2 = 64
 BBOX_IOU_LOSS_WEIGHT = 2.0
 REGRESSION_SIZE_PRIOR = 0.25
 REGRESSION_OUTPUT_IMG = OUTPUT_DIR / "rsna_regression_comparison.png"
@@ -101,6 +103,8 @@ WEIGHT_SCALE_BASELINE = None
 BASELINE_ADC_SCALE = None
 
 kernels = []
+KERNEL_STRIDES = []
+KERNEL_PADDINGS = []
 _noise_bank = {}
 _w_noise_bank = {}
 
@@ -119,7 +123,7 @@ def setup_config(num_layers, input_bits, weight_bits, adc_bits):
     global NUM_LAYERS, INPUT_BITS, WEIGHT_BITS, ADC_BITS
     global INPUT_MAX, INPUT_MIN, WEIGHT_MAX, WEIGHT_MIN, ADC_MAX, ADC_MIN
     global DELTA_BASELINE, WEIGHT_SCALE_BASELINE, BASELINE_ADC_SCALE
-    global kernels, _noise_bank, _w_noise_bank
+    global kernels, KERNEL_STRIDES, KERNEL_PADDINGS, _noise_bank, _w_noise_bank
 
     from core.utils import fp32_to_fp15
     from core.kernels import generate_kernels
@@ -153,6 +157,8 @@ def setup_config(num_layers, input_bits, weight_bits, adc_bits):
 
     # Randomly initialize kernels
     kernels = generate_kernels(NUM_LAYERS, KERNEL_SIZE)
+    KERNEL_STRIDES = [1] * NUM_LAYERS
+    KERNEL_PADDINGS = [0] * NUM_LAYERS
 
     # Reset noise banks
     _noise_bank = {}
@@ -165,7 +171,18 @@ def setup_config(num_layers, input_bits, weight_bits, adc_bits):
 
 def set_kernels(custom_kernels):
     """Override default random kernels (used for regression model conv weights)."""
-    global kernels, _noise_bank, _w_noise_bank
+    global kernels, KERNEL_STRIDES, KERNEL_PADDINGS, _noise_bank, _w_noise_bank
     kernels = custom_kernels
+    KERNEL_STRIDES = [1] * len(custom_kernels)
+    KERNEL_PADDINGS = [0] * len(custom_kernels)
     _noise_bank = {}
     _w_noise_bank = {}
+
+
+def set_kernel_metadata(strides=None, paddings=None):
+    """Attach stride/padding metadata for quantized forward paths."""
+    global KERNEL_STRIDES, KERNEL_PADDINGS
+    if strides is not None:
+        KERNEL_STRIDES = list(strides)
+    if paddings is not None:
+        KERNEL_PADDINGS = list(paddings)
