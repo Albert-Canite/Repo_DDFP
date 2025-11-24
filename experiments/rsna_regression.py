@@ -97,6 +97,37 @@ class RSNABBoxDataset(Dataset):
         return torch.tensor(img_aug, dtype=torch.float32), box
 
 
+def visualize_batch(imgs: torch.Tensor, boxes: torch.Tensor, path: str, max_samples: int = 4):
+    """Quick overlay to验证增广和坐标系是否一致。"""
+
+    imgs = imgs[:max_samples].cpu().numpy()
+    boxes = boxes[:max_samples].cpu().numpy()
+
+    cols = min(max_samples, 2)
+    rows = int(np.ceil(len(imgs) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 4 * rows))
+    if rows == 1 and cols == 1:
+        axes = np.array([[axes]])
+    axes = axes.flatten()
+
+    for idx, (img, box) in enumerate(zip(imgs, boxes)):
+        ax = axes[idx]
+        ax.imshow(img.squeeze(), cmap="gray", vmin=-0.5 if C.INPUT_SIGNED else 0.0, vmax=0.5 if C.INPUT_SIGNED else 1.0)
+        x1, y1, x2, y2 = box * C.IMAGE_SIZE
+        rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=2, edgecolor="lime", facecolor="none")
+        ax.add_patch(rect)
+        ax.set_title(f"idx={idx}")
+        ax.axis("off")
+
+    for ax in axes[len(imgs) :]:
+        ax.axis("off")
+
+    plt.tight_layout()
+    C.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 def load_bbox_items(limit=None):
     if not C.RSNA_LABEL_CSV.exists():
         raise FileNotFoundError(f"Label file not found: {C.RSNA_LABEL_CSV}")
@@ -131,9 +162,18 @@ class RegressionNet(nn.Module):
         super().__init__()
 
         self.backbone, self.kernel_strides, self.kernel_paddings = self._build_backbone()
-        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.spatial_pool = nn.AdaptiveAvgPool2d((C.RSNA_SPATIAL_POOL, C.RSNA_SPATIAL_POOL))
 
-        self.head_in = 256
+        self.coord_enhance = nn.Sequential(
+            nn.Conv2d(256 + 2, 128, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.1, inplace=True),
+        )
+
+        self.head_in = 64 * C.RSNA_SPATIAL_POOL * C.RSNA_SPATIAL_POOL
         self.head = nn.Sequential(
             nn.Linear(self.head_in, C.REGRESSION_HEAD_HIDDEN1),
             nn.ReLU(inplace=True),
@@ -141,6 +181,9 @@ class RegressionNet(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(C.REGRESSION_HEAD_HIDDEN2, 4),
         )
+
+        self._coord_cache = {}
+        self._cached_feature_stats = (None, None)
 
         with torch.no_grad():
             cx, cy = center_prior
@@ -208,14 +251,43 @@ class RegressionNet(nn.Module):
             nn.init.kaiming_normal_(conv.weight, nonlinearity="leaky_relu")
             nn.init.ones_(bn.weight)
             nn.init.zeros_(bn.bias)
+
+        for layer in self.coord_enhance:
+            if isinstance(layer, nn.Conv2d):
+                nn.init.kaiming_normal_(layer.weight, nonlinearity="leaky_relu")
+            elif isinstance(layer, nn.BatchNorm2d):
+                nn.init.ones_(layer.weight)
+                nn.init.zeros_(layer.bias)
+
         for layer in self.head:
             if isinstance(layer, nn.Linear):
                 nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
                 nn.init.zeros_(layer.bias)
 
+    def _get_position_encoding(self, h: int, w: int, device: torch.device) -> torch.Tensor:
+        key = (h, w, device)
+        if key not in self._coord_cache:
+            yy, xx = torch.meshgrid(
+                torch.linspace(0, 1, steps=h, device=device),
+                torch.linspace(0, 1, steps=w, device=device),
+                indexing="ij",
+            )
+            coords = torch.stack([xx, yy], dim=0)  # [2, H, W]
+            self._coord_cache[key] = coords
+        return self._coord_cache[key]
+
     def _encode_features(self, feat: torch.Tensor) -> torch.Tensor:
-        pooled = self.global_pool(feat).flatten(1)
-        return pooled
+        b, _, h, w = feat.shape
+        coords = self._get_position_encoding(h, w, feat.device).unsqueeze(0).expand(b, -1, -1, -1)
+        feat = torch.cat([feat, coords], dim=1)
+        feat = self.coord_enhance(feat)
+        feat = self.spatial_pool(feat)
+        with torch.no_grad():
+            self._cached_feature_stats = (
+                feat.mean(dim=[0, 2, 3]).detach().cpu(),
+                feat.var(dim=[0, 2, 3], unbiased=False).detach().cpu(),
+            )
+        return feat.flatten(1)
 
     def _decode_raw(self, raw: torch.Tensor):
         center = torch.sigmoid(raw[:, :2])
@@ -254,6 +326,9 @@ class RegressionNet(nn.Module):
         for block in self.backbone:
             weights.append(block[0].weight.detach().cpu().numpy())
         return weights, list(self.kernel_strides), list(self.kernel_paddings)
+
+    def feature_stats(self):
+        return self._cached_feature_stats
 
 
 _cached_splits = None
@@ -358,8 +433,10 @@ def train_regression_model(train_set, val_set, priors):
 
     steps_per_epoch = max(len(train_loader), 1)
     log_every = max(int(C.RSNA_LOG_INTERVAL), 1)
+    debug_vis_written = False
 
     for epoch in range(C.RSNA_EPOCHS):
+        center_var_log, size_var_log, feature_var_log = [], [], []
         if epoch < warmup_epochs:
             warmup_factor = float(epoch + 1) / float(max(1, warmup_epochs))
             target_lr = C.RSNA_LR * warmup_factor
@@ -386,11 +463,22 @@ def train_regression_model(train_set, val_set, priors):
             loss_corner = loss_fn(boxes, targets)
             loss_iou = 1.0 - bbox_iou_tensor(boxes, targets)
             loss = loss_cs + 0.5 * loss_corner + C.BBOX_IOU_LOSS_WEIGHT * loss_iou
+            param_sample = next(model.parameters())
+            pre_step = param_sample.data.detach().clone()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             batch_loss = loss.item()
             total_loss += batch_loss * imgs.size(0)
+
+            center_var = center_sizes[:, :2].var(dim=0, unbiased=False)
+            size_var = center_sizes[:, 2:].var(dim=0, unbiased=False)
+            feature_mean, feature_var = model.feature_stats()
+            feature_var_log.append(feature_var.mean().item() if feature_var is not None else float("nan"))
+            center_var_log.append(center_var.mean().item())
+            size_var_log.append(size_var.mean().item())
+
+            weight_delta = (param_sample.data - pre_step).norm().item()
 
             if (
                 step_idx == 1
@@ -400,9 +488,16 @@ def train_regression_model(train_set, val_set, priors):
                 print(
                     f"[Train] epoch {epoch+1}/{C.RSNA_EPOCHS} "
                     f"step {step_idx}/{steps_per_epoch} "
-                    f"loss={batch_loss:.4f}",
+                    f"loss={batch_loss:.4f} center_var={center_var.mean():.4e} "
+                    f"size_var={size_var.mean():.4e} feat_var={(feature_var.mean().item() if feature_var is not None else float('nan')):.4e} "
+                    f"w_update={weight_delta:.4e}",
                     flush=True,
                 )
+
+            if not debug_vis_written and C.RSNA_DEBUG_VIS_SAMPLES > 0:
+                debug_path = C.OUTPUT_DIR / "rsna_aug_debug.png"
+                visualize_batch(imgs.cpu(), boxes.detach().cpu(), debug_path, max_samples=C.RSNA_DEBUG_VIS_SAMPLES)
+                debug_vis_written = True
         avg_loss = total_loss / len(train_loader.dataset)
 
         model.eval()
@@ -433,6 +528,10 @@ def train_regression_model(train_set, val_set, priors):
 
         ema_val_mae = val_mae if ema_val_mae is None else 0.9 * ema_val_mae + 0.1 * val_mae
 
+        mean_center_var = float(np.mean(center_var_log)) if center_var_log else float("nan")
+        mean_size_var = float(np.mean(size_var_log)) if size_var_log else float("nan")
+        mean_feat_var = float(np.mean(feature_var_log)) if feature_var_log else float("nan")
+
         history.append(
             {
                 "epoch": epoch + 1,
@@ -442,6 +541,9 @@ def train_regression_model(train_set, val_set, priors):
                 "val_iou": val_iou,
                 "ema_val_mae": ema_val_mae,
                 "lr": opt.param_groups[0]["lr"],
+                "train_center_var": mean_center_var,
+                "train_size_var": mean_size_var,
+                "train_feat_var": mean_feat_var,
             }
         )
 
