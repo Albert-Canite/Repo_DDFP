@@ -40,7 +40,9 @@ ADC_BITS_LIST = [8]
 RSNA_LABEL_CSV = RSNA_DIR / "stage_2_train_labels.csv"
 RSNA_TRAIN_SAMPLES = 4000
 RSNA_VAL_SAMPLES = 800
-RSNA_BATCH_SIZE = 24
+# Use a conservative batch size to avoid CUDA OOM on 512x512 crops with the
+# wider regression backbone. Increase if your GPU has more memory available.
+RSNA_BATCH_SIZE = 8
 RSNA_EPOCHS = 120
 RSNA_LR = 3e-3
 RSNA_MIN_LR = 3e-5
