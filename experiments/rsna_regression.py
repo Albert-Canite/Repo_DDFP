@@ -281,7 +281,13 @@ class RegressionNet(nn.Module):
         coords = self._get_position_encoding(h, w, feat.device).unsqueeze(0).expand(b, -1, -1, -1)
         feat = torch.cat([feat, coords], dim=1)
         feat = self.coord_enhance(feat)
-        feat = self.spatial_pool(feat)
+
+        if torch.is_deterministic_algorithms_enabled() and h % C.RSNA_SPATIAL_POOL == 0 and w % C.RSNA_SPATIAL_POOL == 0:
+            # Use deterministic avg pooling when the feature map divides evenly
+            k_h, k_w = h // C.RSNA_SPATIAL_POOL, w // C.RSNA_SPATIAL_POOL
+            feat = F.avg_pool2d(feat, kernel_size=(k_h, k_w), stride=(k_h, k_w))
+        else:
+            feat = self.spatial_pool(feat)
         with torch.no_grad():
             self._cached_feature_stats = (
                 feat.mean(dim=[0, 2, 3]).detach().cpu(),
