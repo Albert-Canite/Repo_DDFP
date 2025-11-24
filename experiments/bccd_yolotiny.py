@@ -69,6 +69,11 @@ class BCCDDataset(Dataset):
         img = plt.imread(sample.path)
         if img.ndim == 2:
             img = np.stack([img, img, img], axis=-1)
+        if img.shape[-1] == 4:  # drop alpha channel if present
+            img = img[..., :3]
+        img = img.astype(np.float32)
+        if img.max() > 1.0:
+            img = img / 255.0
         h, w, _ = img.shape
 
         boxes = sample.boxes.copy()
@@ -82,14 +87,13 @@ class BCCDDataset(Dataset):
             img = self._augment_image(img)
 
         boxes_norm = self._normalize_boxes(boxes, w, h)
-        img_resized = torch.tensor(
-            F.interpolate(
-                torch.tensor(img).permute(2, 0, 1).unsqueeze(0),
-                size=(C.IMAGE_SIZE, C.IMAGE_SIZE),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(0)
-        )
+        img_tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
+        img_resized = F.interpolate(
+            img_tensor,
+            size=(C.IMAGE_SIZE, C.IMAGE_SIZE),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
         img_resized = img_resized.clamp(0.0, 1.0)
         boxes_scaled = boxes_norm.copy()
         return img_resized.float(), torch.tensor(boxes_scaled, dtype=torch.float32), torch.tensor(labels, dtype=torch.long)
