@@ -2,6 +2,7 @@ import csv
 from dataclasses import dataclass
 from typing import List, Tuple
 
+import cv2
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
@@ -31,6 +32,46 @@ class RSNABBoxDataset(Dataset):
     def __len__(self):
         return len(self.items)
 
+    def _geom_augment(self, img2d: np.ndarray, box: torch.Tensor):
+        h, w = img2d.shape
+        x1, y1, x2, y2 = box.numpy()
+        coords = np.array([
+            [x1 * w, y1 * h, 1.0],
+            [x2 * w, y2 * h, 1.0],
+            [x1 * w, y2 * h, 1.0],
+            [x2 * w, y1 * h, 1.0],
+        ], dtype=np.float32).T
+
+        scale = np.random.uniform(0.9, 1.1)
+        max_shift = 0.05
+        tx = np.random.uniform(-max_shift, max_shift) * w
+        ty = np.random.uniform(-max_shift, max_shift) * h
+        affine = np.array([[scale, 0.0, tx], [0.0, scale, ty]], dtype=np.float32)
+
+        warped = cv2.warpAffine(
+            img2d,
+            affine,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+
+        warped_coords = affine @ coords
+        xs, ys = warped_coords[0], warped_coords[1]
+        new_x1, new_x2 = xs.min(), xs.max()
+        new_y1, new_y2 = ys.min(), ys.max()
+        new_box = torch.tensor(
+            [new_x1 / w, new_y1 / h, new_x2 / w, new_y2 / h], dtype=torch.float32
+        ).clamp(0.0, 1.0)
+        return warped, new_box
+
+    def _photo_augment(self, img2d: np.ndarray):
+        contrast = np.random.uniform(0.9, 1.1)
+        brightness = np.random.uniform(-0.05, 0.05)
+        img2d = img2d * contrast + brightness
+        lo, hi = (-0.5, 0.5) if C.INPUT_SIGNED else (0.0, 1.0)
+        return np.clip(img2d, lo, hi)
+
     def __getitem__(self, idx):
         item = self.items[idx]
         img_path = C.RSNA_TRAIN_IMG_DIR / f"{item.pid}.dcm"
@@ -41,16 +82,19 @@ class RSNABBoxDataset(Dataset):
             [x / w0, y / h0, (x + w) / w0, (y + h) / h0], dtype=torch.float32
         )
 
+        img2d = img[0, 0]
         if self.augment:
             if np.random.rand() < 0.5:
-                img = np.flip(img, axis=-1).copy()
+                img2d = np.flip(img2d, axis=-1).copy()
                 x1, y1, x2, y2 = box
                 box = torch.tensor([1 - x2, y1, 1 - x1, y2], dtype=torch.float32)
-            if np.random.rand() < 0.3:
-                scale = np.random.uniform(0.9, 1.1)
-                img = np.clip(img * scale, -0.5 if C.INPUT_SIGNED else 0.0, 0.5 if C.INPUT_SIGNED else 1.0)
+            if np.random.rand() < 0.7:
+                img2d, box = self._geom_augment(img2d, box)
+            if np.random.rand() < 0.7:
+                img2d = self._photo_augment(img2d)
 
-        return torch.tensor(img, dtype=torch.float32), box
+        img_aug = img2d[None, None]
+        return torch.tensor(img_aug, dtype=torch.float32), box
 
 
 def load_bbox_items(limit=None):
@@ -58,21 +102,17 @@ def load_bbox_items(limit=None):
         raise FileNotFoundError(f"Label file not found: {C.RSNA_LABEL_CSV}")
 
     items = []
-    seen = set()
     with open(C.RSNA_LABEL_CSV, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             if row.get("Target", "0") != "1":
                 continue
             pid = row["patientId"]
-            if pid in seen:
-                continue
             x = float(row["x"])
             y = float(row["y"])
             w = float(row["width"])
             h = float(row["height"])
             items.append(BBoxItem(pid=pid, box=(x, y, w, h)))
-            seen.add(pid)
             if limit is not None and len(items) >= limit:
                 break
     if not items:
@@ -81,41 +121,24 @@ def load_bbox_items(limit=None):
 
 
 class RegressionNet(nn.Module):
-    """Single-channel CNN compatible with RSNA grayscale input and DDFP/Baseline convolution."""
+    """YOLO-tiny 风格的轻量化特征提取器 + 回归头。"""
 
-    def __init__(self, center_prior=(0.5, 0.5), size_prior=(C.REGRESSION_SIZE_PRIOR, C.REGRESSION_SIZE_PRIOR)):
+    def __init__(
+        self,
+        center_prior=(0.5, 0.5),
+        size_prior=(C.REGRESSION_SIZE_PRIOR, C.REGRESSION_SIZE_PRIOR),
+    ):
         super().__init__()
-        self.convs = nn.ModuleList(
-            [
-                nn.Conv2d(
-                    1 if idx == 0 else C.CONV_CHANNELS,
-                    C.CONV_CHANNELS,
-                    kernel_size=C.KERNEL_SIZE,
-                    padding=C.KERNEL_SIZE // 2,
-                    bias=True,
-                )
-                for idx in range(5)
-            ]
-        )
-        pool_out = 8
-        stride = C.IMAGE_SIZE // pool_out
-        if stride * pool_out != C.IMAGE_SIZE:
-            raise ValueError(
-                f"IMAGE_SIZE={C.IMAGE_SIZE} must be divisible by {pool_out} for deterministic pooling"
-            )
-        # AvgPool2d is deterministic on CUDA, unlike AdaptiveAvgPool2d backward
-        self.pool = nn.AvgPool2d(kernel_size=stride, stride=stride)
-        pooled_feat = pool_out * pool_out * C.CONV_CHANNELS
-        coord_channels = 2  # x,y coordinate maps
-        # After concatenating x/y coordinate channels, the feature width becomes
-        # (C.CONV_CHANNELS + coord_channels) * pool_out * pool_out. Use this exact
-        # dimension to keep the head input aligned with the encoder output.
-        self.head_in = pooled_feat + coord_channels * pool_out * pool_out
+
+        self.backbone, self.kernel_strides, self.kernel_paddings = self._build_backbone()
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        self.head_in = 256
         self.head = nn.Sequential(
             nn.Linear(self.head_in, C.REGRESSION_HEAD_HIDDEN1),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Linear(C.REGRESSION_HEAD_HIDDEN1, C.REGRESSION_HEAD_HIDDEN2),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Linear(C.REGRESSION_HEAD_HIDDEN2, 4),
         )
 
@@ -129,27 +152,70 @@ class RegressionNet(nn.Module):
 
         self._init_weights()
 
+    @staticmethod
+    def _conv_block(in_ch: int, out_ch: int, stride: int, ks: int = 3) -> nn.Sequential:
+        padding = ks // 2
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=ks, stride=stride, padding=padding, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.LeakyReLU(0.1, inplace=True),
+        )
+
+    def _build_backbone(self):
+        blocks = []
+        strides, paddings = [], []
+
+        cfg = [
+            (1, 16, 1),
+            (16, 32, 2),
+            (32, 32, 1),
+            (32, 64, 2),
+            (64, 64, 1),
+            (64, 128, 2),
+            (128, 128, 1),
+            (128, 256, 2),
+            (256, 256, 1),
+            (256, 512, 2),
+        ]
+
+        for in_ch, out_ch, stride in cfg:
+            block = self._conv_block(in_ch, out_ch, stride)
+            blocks.append(block)
+            strides.append(stride)
+            paddings.append(block[0].padding[0])
+
+        # channel squeeze + refinement
+        squeeze = nn.Conv2d(512, 256, kernel_size=1, stride=1, padding=0, bias=False)
+        squeeze_bn = nn.BatchNorm2d(256)
+        refine = nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1, bias=False)
+        refine_bn = nn.BatchNorm2d(256)
+
+        blocks.extend(
+            [
+                nn.Sequential(squeeze, squeeze_bn, nn.LeakyReLU(0.1, inplace=True)),
+                nn.Sequential(refine, refine_bn, nn.LeakyReLU(0.1, inplace=True)),
+            ]
+        )
+        strides.extend([1, 1])
+        paddings.extend([0, 1])
+
+        return nn.ModuleList(blocks), strides, paddings
+
     def _init_weights(self):
-        for conv in self.convs:
-            nn.init.kaiming_normal_(conv.weight, nonlinearity="relu")
-            if conv.bias is not None:
-                nn.init.zeros_(conv.bias)
+        for block in self.backbone:
+            conv = block[0]
+            bn = block[1]
+            nn.init.kaiming_normal_(conv.weight, nonlinearity="leaky_relu")
+            nn.init.ones_(bn.weight)
+            nn.init.zeros_(bn.bias)
         for layer in self.head:
             if isinstance(layer, nn.Linear):
                 nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
                 nn.init.zeros_(layer.bias)
 
-    def _append_coords(self, feat: torch.Tensor) -> torch.Tensor:
-        b, _, h, w = feat.shape
-        device, dtype = feat.device, feat.dtype
-        y_grid = torch.linspace(0.0, 1.0, steps=h, device=device, dtype=dtype).view(1, 1, h, 1).expand(b, 1, h, w)
-        x_grid = torch.linspace(0.0, 1.0, steps=w, device=device, dtype=dtype).view(1, 1, 1, w).expand(b, 1, h, w)
-        return torch.cat([feat, x_grid, y_grid], dim=1)
-
     def _encode_features(self, feat: torch.Tensor) -> torch.Tensor:
-        pooled = self.pool(feat)
-        with_coords = self._append_coords(pooled)
-        return with_coords.flatten(1)
+        pooled = self.global_pool(feat).flatten(1)
+        return pooled
 
     def _decode_raw(self, raw: torch.Tensor):
         center = torch.sigmoid(raw[:, :2])
@@ -163,8 +229,8 @@ class RegressionNet(nn.Module):
     def _forward_internal(self, x):
         if x.dim() == 5:
             x = x.squeeze(1)
-        for conv in self.convs:
-            x = F.relu(conv(x))
+        for conv in self.backbone:
+            x = conv(x)
         encoded = self._encode_features(x)
         raw = self.head(encoded)
         return self._decode_raw(raw)
@@ -178,11 +244,16 @@ class RegressionNet(nn.Module):
 
     def decode_from_features(self, feat: np.ndarray) -> torch.Tensor:
         feat_t = torch.tensor(feat, dtype=torch.float32, device=next(self.parameters()).device)
-        boxes, _ = self._forward_internal(feat_t)
+        encoded = self._encode_features(feat_t)
+        raw = self.head(encoded)
+        boxes, _ = self._decode_raw(raw)
         return boxes
 
     def feature_kernels(self):
-        return [conv.weight.detach().cpu().numpy() for conv in self.convs]
+        weights = []
+        for block in self.backbone:
+            weights.append(block[0].weight.detach().cpu().numpy())
+        return weights, list(self.kernel_strides), list(self.kernel_paddings)
 
 
 _cached_splits = None
@@ -256,8 +327,20 @@ def compute_priors(train_items: List[BBoxItem]):
 def train_regression_model(train_set, val_set, priors):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_loader = DataLoader(train_set, batch_size=C.RSNA_BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=C.RSNA_BATCH_SIZE)
+    pin_memory = device.type == "cuda"
+    train_loader = DataLoader(
+        train_set,
+        batch_size=C.RSNA_BATCH_SIZE,
+        shuffle=True,
+        num_workers=C.RSNA_NUM_WORKERS,
+        pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=C.RSNA_BATCH_SIZE,
+        num_workers=C.RSNA_NUM_WORKERS,
+        pin_memory=pin_memory,
+    )
 
     model = RegressionNet(center_prior=priors[0], size_prior=priors[1]).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=C.RSNA_LR, weight_decay=C.RSNA_WEIGHT_DECAY)
@@ -273,6 +356,9 @@ def train_regression_model(train_set, val_set, priors):
     best_metrics = (float("inf"), 0.0)
     ema_val_mae = None
 
+    steps_per_epoch = max(len(train_loader), 1)
+    log_every = max(int(C.RSNA_LOG_INTERVAL), 1)
+
     for epoch in range(C.RSNA_EPOCHS):
         if epoch < warmup_epochs:
             warmup_factor = float(epoch + 1) / float(max(1, warmup_epochs))
@@ -282,7 +368,12 @@ def train_regression_model(train_set, val_set, priors):
 
         model.train()
         total_loss = 0.0
-        for imgs, targets in train_loader:
+        print(
+            f"[Train] starting epoch {epoch+1}/{C.RSNA_EPOCHS} "
+            f"(batches={steps_per_epoch})",
+            flush=True,
+        )
+        for step_idx, (imgs, targets) in enumerate(train_loader, start=1):
             imgs = imgs.to(device)
             targets = targets.to(device)
             opt.zero_grad()
@@ -291,19 +382,27 @@ def train_regression_model(train_set, val_set, priors):
             targets = order_and_clip_boxes(targets)
             targets_cs = boxes_to_center_size(targets)
 
-            boxes_pix = boxes * C.IMAGE_SIZE
-            targets_pix = targets * C.IMAGE_SIZE
-            cs_pix = center_sizes * C.IMAGE_SIZE
-            targets_cs_pix = targets_cs * C.IMAGE_SIZE
-
-            loss_cs = loss_fn(cs_pix, targets_cs_pix)
-            loss_corner = loss_fn(boxes_pix, targets_pix)
-            loss_iou = 1.0 - bbox_iou_tensor(boxes_pix, targets_pix)
+            loss_cs = loss_fn(center_sizes, targets_cs)
+            loss_corner = loss_fn(boxes, targets)
+            loss_iou = 1.0 - bbox_iou_tensor(boxes, targets)
             loss = loss_cs + 0.5 * loss_corner + C.BBOX_IOU_LOSS_WEIGHT * loss_iou
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            total_loss += loss.item() * imgs.size(0)
+            batch_loss = loss.item()
+            total_loss += batch_loss * imgs.size(0)
+
+            if (
+                step_idx == 1
+                or step_idx % log_every == 0
+                or step_idx == steps_per_epoch
+            ):
+                print(
+                    f"[Train] epoch {epoch+1}/{C.RSNA_EPOCHS} "
+                    f"step {step_idx}/{steps_per_epoch} "
+                    f"loss={batch_loss:.4f}",
+                    flush=True,
+                )
         avg_loss = total_loss / len(train_loader.dataset)
 
         model.eval()
@@ -318,8 +417,8 @@ def train_regression_model(train_set, val_set, priors):
                 targets = order_and_clip_boxes(targets)
                 preds_pix = boxes * C.IMAGE_SIZE
                 targets_pix = targets * C.IMAGE_SIZE
-                loss_l1 = loss_fn(preds_pix, targets_pix)
-                loss_iou = 1.0 - bbox_iou_tensor(preds_pix, targets_pix)
+                loss_l1 = loss_fn(boxes, targets)
+                loss_iou = 1.0 - bbox_iou_tensor(boxes, targets)
                 batch_loss = (loss_l1 + C.BBOX_IOU_LOSS_WEIGHT * loss_iou).item()
                 val_loss += batch_loss * imgs.size(0)
                 val_preds.append(preds_pix.detach().cpu().numpy())
@@ -590,9 +689,10 @@ def run_regression_flow():
 
     calib_imgs = [img.numpy() for img, _ in calib_set]
 
-    kernels = [k for k in model.feature_kernels()]
+    kernels, strides, paddings = model.feature_kernels()
     C.setup_config(len(kernels), C.INPUT_BITS_LIST[0], C.WEIGHT_BITS_LIST[0], C.ADC_BITS_LIST[0])
     C.set_kernels(kernels)
+    C.set_kernel_metadata(strides=strides, paddings=paddings)
 
     calibrate_ddfp(calib_imgs, apply_relu=True)
 
