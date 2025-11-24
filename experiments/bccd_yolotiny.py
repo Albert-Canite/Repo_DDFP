@@ -369,12 +369,14 @@ def build_targets(
 
     for b in range(bs):
         for box, cls in zip(boxes[b], labels[b]):
-            if box.numel() == 0:
+            if box.numel() == 0 or cls < 0:
                 continue
             cx = 0.5 * (box[0] + box[2])
             cy = 0.5 * (box[1] + box[3])
             bw = (box[2] - box[0])
             bh = (box[3] - box[1])
+            if bw <= 0 or bh <= 0:
+                continue
             gi = int(cx * grid_size)
             gj = int(cy * grid_size)
             if gi >= grid_size or gj >= grid_size:
@@ -400,6 +402,11 @@ def bbox_wh_iou(box1, box2):
 def bbox_ciou(pred, target):
     px, py, pw, ph = pred.unbind(-1)
     tx, ty, tw, th = target.unbind(-1)
+    eps = 1e-7
+    pw = pw.clamp(min=eps)
+    ph = ph.clamp(min=eps)
+    tw = tw.clamp(min=eps)
+    th = th.clamp(min=eps)
     pred_x1 = px - pw / 2
     pred_y1 = py - ph / 2
     pred_x2 = px + pw / 2
@@ -439,11 +446,18 @@ class DetectionLoss(nn.Module):
     def forward(self, preds, targets):
         obj_mask = targets[..., 4:5]
         noobj_mask = 1.0 - obj_mask
-        box_pred = preds[..., 0:4]
-        box_tgt = targets[..., 0:4]
 
-        ciou = bbox_ciou(box_pred, box_tgt)
-        box_loss = (1.0 - ciou) * obj_mask.squeeze(-1)
+        # Only compute IoU on positive locations to avoid NaNs from padded or empty boxes
+        pos_mask = obj_mask.squeeze(-1) > 0
+        if pos_mask.any():
+            box_pred = preds[..., 0:4][pos_mask]
+            box_tgt = targets[..., 0:4][pos_mask]
+            ciou_pos = bbox_ciou(box_pred, box_tgt).clamp(min=0.0)
+            box_loss = (1.0 - ciou_pos)
+            mean_ciou = ciou_pos.mean()
+        else:
+            box_loss = torch.zeros(1, device=preds.device)
+            mean_ciou = torch.tensor(0.0, device=preds.device)
 
         obj_loss = self.bce(preds[..., 4:5], obj_mask) * (C.BCCD_OBJ_LOSS_WEIGHT)
         cls_loss = self.bce(preds[..., 5:], targets[..., 5:]) * obj_mask
@@ -462,7 +476,7 @@ class DetectionLoss(nn.Module):
             "obj": obj_loss.mean().item(),
             "cls": cls_loss.mean().item(),
             "noobj": noobj_loss.mean().item(),
-            "ciou": ciou.mean().item(),
+            "ciou": mean_ciou.item(),
         }
 
 
