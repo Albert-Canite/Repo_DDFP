@@ -167,7 +167,7 @@ class RegressionNet(nn.Module):
         return self._forward_internal(x)
 
     def decode_from_features(self, feat: np.ndarray) -> torch.Tensor:
-        feat_t = torch.tensor(feat, dtype=torch.float32)
+        feat_t = torch.tensor(feat, dtype=torch.float32, device=next(self.parameters()).device)
         boxes, _ = self._forward_internal(feat_t)
         return boxes
 
@@ -245,6 +245,7 @@ def compute_priors(train_items: List[BBoxItem]):
 
 def train_regression_model(train_set, val_set, priors):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Setup] device={device} train_samples={len(train_set)} val_samples={len(val_set)}")
 
     train_loader = DataLoader(train_set, batch_size=C.RSNA_BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=C.RSNA_BATCH_SIZE)
@@ -356,8 +357,7 @@ def load_or_train_model(train_set, val_set, priors):
     model = RegressionNet(center_prior=priors[0], size_prior=priors[1]).to(device)
     if C.REGRESSION_CKPT.exists():
         try:
-            state = torch.load(C.REGRESSION_CKPT, map_location="cpu")
-            model.load_state_dict(state)
+            model.load_state_dict(torch.load(C.REGRESSION_CKPT, map_location=device))
             print(f"[Load] using existing model {C.REGRESSION_CKPT}")
             return model.cpu()
         except RuntimeError as err:
@@ -472,12 +472,12 @@ def plot_training_history(history):
     print(f"[Saved] {C.REGRESSION_TRAIN_CURVE}")
 
 
-def evaluate_fp32(model, test_set):
+def evaluate_fp32(model, test_set, device):
     fp_preds, gts = [], []
     with torch.no_grad():
         for img, target in test_set:
-            fp_out = model(img.unsqueeze(0))
-            fp_out = order_and_clip_boxes(fp_out).squeeze(0).numpy() * C.IMAGE_SIZE
+            fp_out = model(img.unsqueeze(0).to(device))
+            fp_out = order_and_clip_boxes(fp_out).squeeze(0).detach().cpu().numpy() * C.IMAGE_SIZE
             fp_preds.append(sanitize_box(fp_out))
             gts.append(sanitize_box(target.numpy() * C.IMAGE_SIZE))
     mae_fp, iou_fp = compute_metrics(fp_preds, gts)
@@ -560,8 +560,9 @@ def run_regression_flow():
     priors = compute_priors(train_set.items)
     print(f"[Prior] center={priors[0]}, size={priors[1]}")
     model = load_or_train_model(train_set, val_set, priors)
+    device = next(model.parameters()).device
 
-    fp_preds, gts, fp_metrics = evaluate_fp32(model, test_set)
+    fp_preds, gts, fp_metrics = evaluate_fp32(model, test_set, device)
     save_fp32_tracking(test_set, fp_preds, gts, fp_metrics)
     save_fp32_fig(test_set, fp_preds, gts, fp_metrics)
 
@@ -587,7 +588,7 @@ def run_regression_flow():
         for name, feat in [("DDFP", ddfp_out), ("BASE", base_out)]:
             with torch.no_grad():
                 pred = model.decode_from_features(feat)
-                pred = order_and_clip_boxes(pred).squeeze(0).numpy() * C.IMAGE_SIZE
+                pred = order_and_clip_boxes(pred).squeeze(0).detach().cpu().numpy() * C.IMAGE_SIZE
                 pred = sanitize_box(pred)
             if name == "DDFP":
                 ddfp_preds.append(pred)
