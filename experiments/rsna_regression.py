@@ -802,7 +802,7 @@ def run_regression_flow():
     C.set_kernels(kernels)
     C.set_kernel_metadata(strides=strides, paddings=paddings)
 
-    calibrate_ddfp(calib_imgs, apply_relu=True)
+    calibrate_ddfp(calib_imgs)
 
     ddfp_preds, base_preds = [], []
     snr_records = []
@@ -811,9 +811,9 @@ def run_regression_flow():
         img_np = img.numpy()
         gt = target.numpy()
 
-        feat_fp32 = run_network_fp32(img_np, C.kernels, apply_relu=True)
-        ddfp_out, _, _, _ = run_network_ddfp(img_np, apply_relu=True)
-        base_out, _, _ = run_network_baseline(img_np, apply_relu=True)
+        feat_fp32 = run_network_fp32(img_np, C.kernels, apply_activation=True)
+        ddfp_out, _, _, _ = run_network_ddfp(img_np)
+        base_out, _, _ = run_network_baseline(img_np)
 
         for name, feat in [("DDFP", ddfp_out), ("BASE", base_out)]:
             with torch.no_grad():
