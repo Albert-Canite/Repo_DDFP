@@ -282,7 +282,7 @@ class RegressionNet(nn.Module):
         feat = torch.cat([feat, coords], dim=1)
         feat = self.coord_enhance(feat)
 
-        if torch.is_deterministic_algorithms_enabled() and h % C.RSNA_SPATIAL_POOL == 0 and w % C.RSNA_SPATIAL_POOL == 0:
+        if torch.are_deterministic_algorithms_enabled() and h % C.RSNA_SPATIAL_POOL == 0 and w % C.RSNA_SPATIAL_POOL == 0:
             # Use deterministic avg pooling when the feature map divides evenly
             k_h, k_w = h // C.RSNA_SPATIAL_POOL, w // C.RSNA_SPATIAL_POOL
             feat = F.avg_pool2d(feat, kernel_size=(k_h, k_w), stride=(k_h, k_w))
