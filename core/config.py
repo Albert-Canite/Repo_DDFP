@@ -20,7 +20,11 @@ INPUT_SIGNED = True
 NUM_CALIBRATION = 50
 NUM_TEST = 2
 KERNEL_SIZE = 4
-CONV_CHANNELS = 1
+
+# Convolutional backbone width for the RSNA regression model. The previous
+# single-channel setting severely limited model capacity and led to stagnant
+# training/validation losses, so we raise it to a small but expressive value.
+CONV_CHANNELS = 16
 
 # Task selector: "simple" keeps the original kernel test; "rsna_regression" runs the RSNA regression network
 TASK_TYPE = "simple"
