@@ -100,7 +100,10 @@ class RegressionNet(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d((8, 8))
         pooled_feat = 8 * 8 * C.CONV_CHANNELS
         coord_channels = 2  # x,y coordinate maps
-        self.head_in = pooled_feat * (1 + coord_channels)
+        # After concatenating x/y coordinate channels, the feature width becomes
+        # (C.CONV_CHANNELS + coord_channels) * 8 * 8. Use this exact dimension
+        # to keep the head input aligned with the encoder output.
+        self.head_in = pooled_feat + coord_channels * 8 * 8
         self.head = nn.Sequential(
             nn.Linear(self.head_in, C.REGRESSION_HEAD_HIDDEN1),
             nn.ReLU(),
@@ -245,7 +248,6 @@ def compute_priors(train_items: List[BBoxItem]):
 
 def train_regression_model(train_set, val_set, priors):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Setup] device={device} train_samples={len(train_set)} val_samples={len(val_set)}")
 
     train_loader = DataLoader(train_set, batch_size=C.RSNA_BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=C.RSNA_BATCH_SIZE)
@@ -357,7 +359,8 @@ def load_or_train_model(train_set, val_set, priors):
     model = RegressionNet(center_prior=priors[0], size_prior=priors[1]).to(device)
     if C.REGRESSION_CKPT.exists():
         try:
-            model.load_state_dict(torch.load(C.REGRESSION_CKPT, map_location=device))
+            state = torch.load(C.REGRESSION_CKPT, map_location="cpu")
+            model.load_state_dict(state)
             print(f"[Load] using existing model {C.REGRESSION_CKPT}")
             return model.cpu()
         except RuntimeError as err:
