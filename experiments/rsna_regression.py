@@ -117,6 +117,18 @@ class RegressionNet(nn.Module):
             prior_logits = torch.logit(prior)
             self.head[-1].bias.copy_(prior_logits)
 
+        self._init_weights()
+
+    def _init_weights(self):
+        for conv in self.convs:
+            nn.init.kaiming_normal_(conv.weight, nonlinearity="relu")
+            if conv.bias is not None:
+                nn.init.zeros_(conv.bias)
+        for layer in self.head:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+                nn.init.zeros_(layer.bias)
+
     def _append_coords(self, feat: torch.Tensor) -> torch.Tensor:
         b, _, h, w = feat.shape
         device, dtype = feat.device, feat.dtype
@@ -334,9 +346,10 @@ def train_regression_model(train_set, val_set, priors):
         )
 
     C.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), C.REGRESSION_CKPT)
+    model_cpu = model.to("cpu")
+    torch.save(model_cpu.state_dict(), C.REGRESSION_CKPT)
     plot_training_history(history)
-    return model
+    return model_cpu
 
 
 def load_or_train_model(train_set, val_set, priors):
@@ -346,7 +359,7 @@ def load_or_train_model(train_set, val_set, priors):
         try:
             model.load_state_dict(torch.load(C.REGRESSION_CKPT, map_location=device))
             print(f"[Load] using existing model {C.REGRESSION_CKPT}")
-            return model
+            return model.cpu()
         except RuntimeError as err:
             backup = C.REGRESSION_CKPT.with_suffix(".ckpt.incompatible")
             try:
