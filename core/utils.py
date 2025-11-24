@@ -14,6 +14,27 @@ from core.config import (
 )
 
 
+def _normalize_image(img: np.ndarray) -> np.ndarray:
+    """Apply a robust per-slice normalization.
+
+    1. Clip extreme values using percentiles to avoid being dominated by noise.
+    2. Standardize to zero mean / unit std to stabilize the regression loss.
+    3. Map to [-0.5, 0.5] (or [0, 1] for unsigned) so ReLU layers keep signal.
+    """
+
+    lo, hi = np.percentile(img, [1.0, 99.0])
+    img = np.clip(img, lo, hi)
+    mean = img.mean()
+    std = img.std()
+    img = (img - mean) / max(std, 1e-6)
+
+    if INPUT_SIGNED:
+        img = np.clip(img, -4.0, 4.0) / 8.0  # [-0.5, 0.5]
+    else:
+        img = (np.clip(img, -4.0, 4.0) / 8.0) + 0.5
+    return img
+
+
 def load_dicom_image(path, return_shape: bool = False):
     dcm = pydicom.dcmread(path)
     orig_shape = dcm.pixel_array.shape  # (H, W)
@@ -25,10 +46,7 @@ def load_dicom_image(path, return_shape: bool = False):
         center, width = -600.0, 1500.0
         img = np.clip(img, center - width / 2, center + width / 2)
 
-    vmin, vmax = img.min(), img.max()
-    img = (img - vmin) / (vmax - vmin + 1e-8)
-    if INPUT_SIGNED:
-        img = img - 0.5
+    img = _normalize_image(img)
 
     img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_AREA)
 
