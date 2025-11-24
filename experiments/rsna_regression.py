@@ -97,13 +97,20 @@ class RegressionNet(nn.Module):
                 for idx in range(5)
             ]
         )
-        self.pool = nn.AdaptiveAvgPool2d((8, 8))
-        pooled_feat = 8 * 8 * C.CONV_CHANNELS
+        pool_out = 8
+        stride = C.IMAGE_SIZE // pool_out
+        if stride * pool_out != C.IMAGE_SIZE:
+            raise ValueError(
+                f"IMAGE_SIZE={C.IMAGE_SIZE} must be divisible by {pool_out} for deterministic pooling"
+            )
+        # AvgPool2d is deterministic on CUDA, unlike AdaptiveAvgPool2d backward
+        self.pool = nn.AvgPool2d(kernel_size=stride, stride=stride)
+        pooled_feat = pool_out * pool_out * C.CONV_CHANNELS
         coord_channels = 2  # x,y coordinate maps
         # After concatenating x/y coordinate channels, the feature width becomes
-        # (C.CONV_CHANNELS + coord_channels) * 8 * 8. Use this exact dimension
-        # to keep the head input aligned with the encoder output.
-        self.head_in = pooled_feat + coord_channels * 8 * 8
+        # (C.CONV_CHANNELS + coord_channels) * pool_out * pool_out. Use this exact
+        # dimension to keep the head input aligned with the encoder output.
+        self.head_in = pooled_feat + coord_channels * pool_out * pool_out
         self.head = nn.Sequential(
             nn.Linear(self.head_in, C.REGRESSION_HEAD_HIDDEN1),
             nn.ReLU(),
@@ -255,7 +262,7 @@ def train_regression_model(train_set, val_set, priors):
     model = RegressionNet(center_prior=priors[0], size_prior=priors[1]).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=C.RSNA_LR, weight_decay=C.RSNA_WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, factor=0.3, patience=4, verbose=False, min_lr=1e-5
+        opt, factor=0.3, patience=4, min_lr=1e-5
     )
     loss_fn = nn.L1Loss()
     history = []
