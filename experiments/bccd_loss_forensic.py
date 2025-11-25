@@ -189,7 +189,14 @@ def main():
     raw = model(imgs)
     pred_boxes, pred_obj, pred_cls, grid = bccd._decode_raw(raw, anchors)
     targets, ignore_mask = bccd.build_targets(
-        boxes, labels, anchors, grid, len(C.BCCD_CLASSES), ignore_thresh=C.BCCD_IGNORE_IOU
+        boxes,
+        labels,
+        anchors,
+        grid,
+        len(C.BCCD_CLASSES),
+        ignore_thresh=C.BCCD_IGNORE_IOU,
+        neighbor_range=0,
+        debug=True,
     )
     legacy_targets, legacy_ignore = _legacy_build_targets(
         boxes, labels, anchors, grid, len(C.BCCD_CLASSES), ignore_thresh=C.BCCD_IGNORE_IOU
