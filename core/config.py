@@ -34,13 +34,31 @@ ADC_BITS_LIST = [8]
 
 # BCCD detection
 BCCD_CLASSES = ["RBC", "WBC", "Platelets"]
+# Default anchors will be overridden by on-the-fly k-means fit at runtime. These
+# six priors come from running k-means (k=6) on the bundled BCCD annotations at
+# 512×512 scale for offline reproducibility.
 BCCD_ANCHORS = [
-    (12, 12),
-    (24, 24),
-    (36, 36),
+    # These are overwritten at runtime after fitting on raw annotations; kept
+    # for offline determinism when fitting is skipped.
+    (28.0, 27.0),
+    (34.0, 36.0),
+    (42.0, 46.0),
+    (55.0, 60.0),
+    (72.0, 78.0),
+    (95.0, 104.0),
 ]
 BCCD_KMEANS_K = 6
 BCCD_KMEANS_ITERS = 25
+BCCD_ANCHOR_MIN_IOU = 0.25
+BCCD_POS_TOPK = 3
+BCCD_POS_IOU_THRESH = 0.25
+BCCD_NOOBJ_WEIGHT = 0.1
+BCCD_NOOBJ_OBJ_THRESH = 0.7
+BCCD_FOCAL_GAMMA = 2.0
+BCCD_FOCAL_ALPHA = 0.25
+# Keep enough pre-NMS candidates so that low-scoring but spatially diverse boxes
+# are not dropped prematurely during debugging/early training.
+BCCD_SCORE_TOPK = 200
 BCCD_BATCH_SIZE = 4
 BCCD_NUM_WORKERS = 2
 BCCD_LR = 2e-3
@@ -63,8 +81,8 @@ BCCD_BOX_LOSS_WEIGHT = 5.0
 BCCD_IOU_LOSS_WEIGHT = 2.0
 BCCD_GN_GROUPS = 8
 BCCD_GRID_SIZE = 16
-BCCD_MAX_BOXES = 50
-BCCD_SCORE_THRESH = 0.5
+BCCD_MAX_BOXES = 30
+BCCD_SCORE_THRESH = 0.25
 BCCD_NMS_IOU = 0.5
 BCCD_IGNORE_IOU = 0.5
 BCCD_WARMUP_ITERS = 100
