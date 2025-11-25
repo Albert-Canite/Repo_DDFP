@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import warnings
+
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import numpy as np
@@ -135,6 +137,7 @@ def _load_coco(anno_path: Path) -> List[DetectionSample]:
         file_name = id_to_file[img_id]
         w, h = id_to_size[img_id]
         boxes_raw = np.array([it[0] for it in items], dtype=np.float32)
+        _validate_annotation(boxes_raw, (w, h), anno_path)
         boxes = _clean_boxes_static(boxes_raw, w, h)
         if boxes.shape[0] != len(items):
             labels = [it[1] for it in items[: boxes.shape[0]]]
@@ -252,11 +255,12 @@ def _load_csv(anno_path: Path) -> List[DetectionSample]:
             print(f"[Warning] image not found for annotation: {img_path}")
             continue
         boxes = np.array(data["boxes"], dtype=np.float32)
-        labels = data["labels"]
         w, h = data["size"]
         if w is None or h is None:
             img = plt.imread(img_path)
             h, w = img.shape[:2]
+        _validate_annotation(boxes, (w, h), anno_path)
+        labels = data["labels"]
         boxes = _clean_boxes_static(boxes, w, h)
         if boxes.shape[0] != len(labels):
             labels = labels[: boxes.shape[0]]
@@ -316,6 +320,24 @@ def _clean_boxes_static(boxes: np.ndarray, w: int, h: int) -> np.ndarray:
     boxes_clean[:, [1, 3]] = np.clip(boxes_clean[:, [1, 3]], 0, h)
     valid = (boxes_clean[:, 2] - boxes_clean[:, 0] > 1.0) & (boxes_clean[:, 3] - boxes_clean[:, 1] > 1.0)
     return boxes_clean[valid]
+
+
+def _validate_annotation(boxes: np.ndarray, size: Tuple[int, int], source: Path):
+    """Sanity-check raw annotation tensors before normalization/cleanup."""
+
+    if boxes.size == 0:
+        return
+
+    w, h = size
+    if w is None or h is None or w <= 0 or h <= 0:
+        warnings.warn(f"[Label] invalid image size from {source}: (w={w}, h={h})")
+        return
+
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    if np.any(x2 <= x1) or np.any(y2 <= y1):
+        warnings.warn(f"[Label] found non-positive box width/height in {source}")
+    if np.any(x1 < -1) or np.any(y1 < -1) or np.any(x2 > w + 1) or np.any(y2 > h + 1):
+        warnings.warn(f"[Label] box coords exceed image bounds in {source}")
 
 
 class StdConv(nn.Conv2d):
@@ -406,6 +428,57 @@ class YoloTiny(nn.Module):
         strides.append(self.head.stride[0])
         paddings.append(self.head.padding[0])
         return kernels, strides, paddings, gn_meta
+
+
+def _prepare_grid_and_anchors(
+    device: torch.device, anchors: List[Tuple[int, int]], grid: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Create mesh-grid and anchor tensors on the correct device.
+
+    Keeping this logic in one place guarantees that training, evaluation, and
+    visualization use identical coordinate transforms (grid alignment, anchor
+    scaling, and normalization by image size).
+    """
+
+    grid_y, grid_x = torch.meshgrid(
+        torch.arange(grid, device=device), torch.arange(grid, device=device), indexing="ij"
+    )
+    anchor_tensor = torch.tensor(anchors, device=device, dtype=torch.float32)
+    anchor_w = anchor_tensor[:, 0].view(1, len(anchors), 1, 1)
+    anchor_h = anchor_tensor[:, 1].view(1, len(anchors), 1, 1)
+    stride = C.IMAGE_SIZE / float(grid)
+    return grid_x, grid_y, anchor_w, anchor_h, stride
+
+
+def _decode_raw(preds: torch.Tensor, anchors: List[Tuple[int, int]]):
+    """Decode network logits to center-size boxes while retaining logits for loss."""
+
+    bs, _, h, w = preds.shape
+    num_classes = len(C.BCCD_CLASSES)
+    if h != w:
+        raise ValueError(f"Prediction map is not square: H={h}, W={w}")
+    grid = h
+    preds = preds.view(bs, len(anchors), 5 + num_classes, grid, grid).permute(0, 1, 3, 4, 2)
+    grid_x, grid_y, anchor_w, anchor_h, stride = _prepare_grid_and_anchors(preds.device, anchors, grid)
+
+    pred_xy = torch.sigmoid(preds[..., 0:2])
+    pred_wh = torch.exp(preds[..., 2:4])
+    pred_obj = preds[..., 4:5]
+    pred_cls = preds[..., 5:]
+
+    bx = (pred_xy[..., 0] + grid_x) / grid
+    by = (pred_xy[..., 1] + grid_y) / grid
+    bw = (pred_wh[..., 0] * anchor_w) / C.IMAGE_SIZE
+    bh = (pred_wh[..., 1] * anchor_h) / C.IMAGE_SIZE
+    boxes = torch.stack([bx, by, bw, bh], dim=-1)
+    return boxes, pred_obj, pred_cls, grid
+
+
+def _cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+    cx, cy, w, h = boxes.unbind(-1)
+    half_w = w / 2
+    half_h = h / 2
+    return torch.stack([cx - half_w, cy - half_h, cx + half_w, cy + half_h], dim=-1)
 
 
 def build_targets(
@@ -553,44 +626,26 @@ def decode_predictions(
     score_thresh: float,
     max_boxes: int = C.BCCD_MAX_BOXES,
 ):
-    bs, _, h, w = preds.shape
-    num_anchors = len(anchors)
-    num_classes = len(C.BCCD_CLASSES)
-    preds = preds.view(bs, num_anchors, 5 + num_classes, h, w).permute(0, 1, 3, 4, 2)
-    grid_y, grid_x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
-    grid_x = grid_x.to(preds.device)
-    grid_y = grid_y.to(preds.device)
-    anchor_w = torch.tensor([a[0] for a in anchors], device=preds.device).view(1, num_anchors, 1, 1)
-    anchor_h = torch.tensor([a[1] for a in anchors], device=preds.device).view(1, num_anchors, 1, 1)
+    boxes_cxcywh, obj_logit, cls_logit, _ = _decode_raw(preds, anchors)
+    pred_obj = torch.sigmoid(obj_logit.squeeze(-1))
+    pred_cls = torch.sigmoid(cls_logit)
 
-    pred_xy = torch.sigmoid(preds[..., 0:2])
-    pred_wh = torch.exp(preds[..., 2:4])
-    pred_obj = torch.sigmoid(preds[..., 4])
-    pred_cls = torch.sigmoid(preds[..., 5:])
-
-    bx = (pred_xy[..., 0] + grid_x) / w
-    by = (pred_xy[..., 1] + grid_y) / h
-    bw = (pred_wh[..., 0] * anchor_w) / C.IMAGE_SIZE
-    bh = (pred_wh[..., 1] * anchor_h) / C.IMAGE_SIZE
-
+    boxes_xyxy = _cxcywh_to_xyxy(boxes_cxcywh).clamp(0.0, 1.0)
     scores, cls_idx = torch.max(pred_cls, dim=-1)
     scores = scores * pred_obj
 
-    boxes = torch.stack([bx - bw / 2, by - bh / 2, bx + bw / 2, by + bh / 2], dim=-1)
-    boxes = boxes.clamp(0.0, 1.0)
     mask = scores > score_thresh
     outputs = []
-    for b in range(bs):
+    for b in range(preds.size(0)):
         b_mask = mask[b]
         if b_mask.sum() == 0:
             outputs.append((torch.empty((0, 4)), torch.empty((0,), dtype=torch.long), torch.empty((0,))))
             continue
-        b_boxes = boxes[b][b_mask]
+        b_boxes = boxes_xyxy[b][b_mask]
         b_scores = scores[b][b_mask]
         b_cls = cls_idx[b][b_mask]
         keep = nms(b_boxes, b_scores, C.BCCD_NMS_IOU)
         if keep.numel() > 0:
-            # sort by confidence to ensure deterministic top-K selection
             keep_scores = b_scores[keep]
             sorted_idx = torch.argsort(keep_scores, descending=True)
             keep = keep[sorted_idx][: max_boxes]
@@ -710,32 +765,10 @@ def train_epoch(model, loader, optimizer, scheduler, device, anchors, loss_fn):
         labels = labels.to(device)
         optimizer.zero_grad()
         raw = model(imgs)
-        grid = raw.shape[-1]
+        pred_boxes, pred_obj, pred_cls, grid = _decode_raw(raw, anchors)
         targets, ignore_mask = build_targets(
             boxes, labels, anchors, grid, len(C.BCCD_CLASSES), ignore_thresh=C.BCCD_IGNORE_IOU
         )
-
-        raw = raw.view(
-            imgs.size(0), len(anchors), 5 + len(C.BCCD_CLASSES), grid, grid
-        ).permute(0, 1, 3, 4, 2)
-
-        grid_y, grid_x = torch.meshgrid(
-            torch.arange(grid, device=device), torch.arange(grid, device=device), indexing="ij"
-        )
-        anchor_w = torch.tensor([a[0] for a in anchors], device=device).view(1, len(anchors), 1, 1)
-        anchor_h = torch.tensor([a[1] for a in anchors], device=device).view(1, len(anchors), 1, 1)
-
-        pred_xy = torch.sigmoid(raw[..., 0:2])
-        pred_wh = torch.exp(raw[..., 2:4])
-        pred_obj = raw[..., 4:5]
-        pred_cls = raw[..., 5:]
-
-        bx = (pred_xy[..., 0] + grid_x) / grid
-        by = (pred_xy[..., 1] + grid_y) / grid
-        bw = (pred_wh[..., 0] * anchor_w) / C.IMAGE_SIZE
-        bh = (pred_wh[..., 1] * anchor_h) / C.IMAGE_SIZE
-        pred_boxes = torch.stack([bx, by, bw, bh], dim=-1)
-
         preds = torch.cat([pred_boxes, pred_obj, pred_cls], dim=-1)
         loss, detail = loss_fn(preds, targets, ignore_mask)
         loss.backward()
@@ -779,31 +812,11 @@ def evaluate_loss(model, loader, device, anchors, loss_fn):
             boxes = boxes.to(device)
             labels = labels.to(device)
             raw = model(imgs)
-            grid = raw.shape[-1]
+            pred_boxes, pred_obj, pred_cls, grid = _decode_raw(raw, anchors)
             targets, ignore_mask = build_targets(
                 boxes, labels, anchors, grid, len(C.BCCD_CLASSES), ignore_thresh=C.BCCD_IGNORE_IOU
             )
 
-            raw = raw.view(
-                imgs.size(0), len(anchors), 5 + len(C.BCCD_CLASSES), grid, grid
-            ).permute(0, 1, 3, 4, 2)
-
-            grid_y, grid_x = torch.meshgrid(
-                torch.arange(grid, device=device), torch.arange(grid, device=device), indexing="ij"
-            )
-            anchor_w = torch.tensor([a[0] for a in anchors], device=device).view(1, len(anchors), 1, 1)
-            anchor_h = torch.tensor([a[1] for a in anchors], device=device).view(1, len(anchors), 1, 1)
-
-            pred_xy = torch.sigmoid(raw[..., 0:2])
-            pred_wh = torch.exp(raw[..., 2:4])
-            pred_obj = raw[..., 4:5]
-            pred_cls = raw[..., 5:]
-
-            bx = (pred_xy[..., 0] + grid_x) / grid
-            by = (pred_xy[..., 1] + grid_y) / grid
-            bw = (pred_wh[..., 0] * anchor_w) / C.IMAGE_SIZE
-            bh = (pred_wh[..., 1] * anchor_h) / C.IMAGE_SIZE
-            pred_boxes = torch.stack([bx, by, bw, bh], dim=-1)
             preds = torch.cat([pred_boxes, pred_obj, pred_cls], dim=-1)
             loss, _ = loss_fn(preds, targets, ignore_mask)
             total_loss += loss.item() * imgs.size(0)
