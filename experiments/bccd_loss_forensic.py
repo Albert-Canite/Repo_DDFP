@@ -132,6 +132,16 @@ def main():
         pos_tgts = targets[..., 0:4][pos_mask]
         _tensor_stats("pred_boxes_pos", pos_preds)
         _tensor_stats("target_boxes_pos", pos_tgts)
+
+        # Compare IoU used in loss (cxcywh CIoU) vs. IoU in xyxy eval space for the first positive sample
+        ciou_used = bccd.bbox_ciou(pos_preds[:1], pos_tgts[:1]).squeeze().item()
+        first_pred_xyxy = bccd._cxcywh_to_xyxy(pos_preds[:1]).squeeze(0)
+        first_tgt_xyxy = bccd._cxcywh_to_xyxy(pos_tgts[:1]).squeeze(0)
+        iou_xyxy = float(bccd.box_iou_single(first_pred_xyxy, first_tgt_xyxy))
+        print(
+            f"first_pos_ciou_current={ciou_used:.6f} (cxcywh space) iou_xyxy_eval_space={iou_xyxy:.6f}"
+        )
+        print(f"first_pred_xyxy={first_pred_xyxy.tolist()} first_tgt_xyxy={first_tgt_xyxy.tolist()}")
     else:
         print("no positive samples in this batch for regression loss")
 
