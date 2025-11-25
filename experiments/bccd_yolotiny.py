@@ -300,14 +300,15 @@ class YoloTiny(nn.Module):
     def __init__(self, num_classes: int, anchors: List[Tuple[int, int]]):
         super().__init__()
         self.anchors = anchors
-        width = [16, 32, 64, 128, 256, 256]
+        # shallower downsampling to keep higher-resolution grid for dense BCCD objects
+        width = [16, 32, 64, 128, 128, 128]
         layers = []
         in_ch = 3
         strides = []
         paddings = []
         gn_meta = []
         for idx, out_ch in enumerate(width):
-            stride = 2 if idx < 5 else 1
+            stride = 2 if idx < 4 else 1  # final grid 32x32 at 512 input (stride 16)
             block = ConvGNAct(in_ch, out_ch, k=3, s=stride)
             layers.append(block)
             strides.append(stride)
@@ -393,14 +394,21 @@ def build_targets(
                 continue
             box_wh = torch.tensor([bw * C.IMAGE_SIZE, bh * C.IMAGE_SIZE], device=device)
             anchor_wh = anchor_tensor
-            iou = bbox_wh_iou(box_wh[None], anchor_wh)
-            best = torch.argmax(iou)
-            targets[b, best, gj, gi, 0:4] = torch.tensor([cx, cy, bw, bh], device=device)
-            targets[b, best, gj, gi, 4] = 1.0
-            targets[b, best, gj, gi, 5 + cls] = 1.0
+            iou = bbox_wh_iou(box_wh[None], anchor_wh).squeeze(0)
+            order = torch.argsort(iou, descending=True)
+            placed = False
+            for idx_anchor in order[: min(3, num_anchors)]:  # allow multiple boxes per cell via different anchors
+                if targets[b, idx_anchor, gj, gi, 4] == 0:
+                    targets[b, idx_anchor, gj, gi, 0:4] = torch.tensor(
+                        [cx, cy, bw, bh], device=device
+                    )
+                    targets[b, idx_anchor, gj, gi, 4] = 1.0
+                    targets[b, idx_anchor, gj, gi, 5 + cls] = 1.0
+                    placed = True
+                    break
 
-            # ignore negatives for anchors that have decent overlap to avoid over-penalizing
-            ignore_mask[b, :, gj, gi] = torch.where(iou.squeeze(0) > ignore_thresh, 1.0, ignore_mask[b, :, gj, gi])
+            if placed:
+                ignore_mask[b, :, gj, gi] = torch.where(iou > ignore_thresh, 1.0, ignore_mask[b, :, gj, gi])
     return targets, ignore_mask
 
 
@@ -519,6 +527,7 @@ def decode_predictions(preds: torch.Tensor, anchors: List[Tuple[int, int]], scor
     scores = scores * pred_obj
 
     boxes = torch.stack([bx - bw / 2, by - bh / 2, bx + bw / 2, by + bh / 2], dim=-1)
+    boxes = boxes.clamp(0.0, 1.0)
     mask = scores > score_thresh
     outputs = []
     for b in range(bs):
@@ -882,7 +891,17 @@ def load_checkpoint(model, optimizer=None, scheduler=None):
     if not C.BCCD_CKPT.exists():
         return 0
     ckpt = torch.load(C.BCCD_CKPT, map_location="cpu")
-    model.load_state_dict(ckpt["model"])
+    ckpt_state = ckpt.get("model", {})
+    model_state = model.state_dict()
+    matched = {k: v for k, v in ckpt_state.items() if k in model_state and model_state[k].shape == v.shape}
+    skipped = [k for k in ckpt_state.keys() if k not in matched]
+    model_state.update(matched)
+    model.load_state_dict(model_state, strict=False)
+    if skipped:
+        print(
+            f"[Checkpoint] loaded with shape-mismatched keys skipped ({len(skipped)}): "
+            f"{', '.join(sorted(skipped))}"
+        )
     if optimizer and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler and "scheduler" in ckpt:
