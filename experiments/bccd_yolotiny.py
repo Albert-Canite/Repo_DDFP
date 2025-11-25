@@ -360,11 +360,13 @@ def build_targets(
     anchors: List[Tuple[int, int]],
     grid_size: int,
     num_classes: int,
+    ignore_thresh: float = 0.5,
 ):
     device = boxes.device
     bs = boxes.shape[0]
     num_anchors = len(anchors)
     targets = torch.zeros(bs, num_anchors, grid_size, grid_size, 5 + num_classes, device=device)
+    ignore_mask = torch.zeros(bs, num_anchors, grid_size, grid_size, device=device)
     anchor_tensor = torch.tensor(anchors, device=device, dtype=torch.float32)
 
     for b in range(bs):
@@ -388,7 +390,10 @@ def build_targets(
             targets[b, best, gj, gi, 0:4] = torch.tensor([cx, cy, bw, bh], device=device)
             targets[b, best, gj, gi, 4] = 1.0
             targets[b, best, gj, gi, 5 + cls] = 1.0
-    return targets
+
+            # ignore negatives for anchors that have decent overlap to avoid over-penalizing
+            ignore_mask[b, :, gj, gi] = torch.where(iou.squeeze(0) > ignore_thresh, 1.0, ignore_mask[b, :, gj, gi])
+    return targets, ignore_mask
 
 
 def bbox_wh_iou(box1, box2):
@@ -443,9 +448,10 @@ class DetectionLoss(nn.Module):
         self.num_classes = num_classes
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
 
-    def forward(self, preds, targets):
+    def forward(self, preds, targets, ignore_mask=None):
         obj_mask = targets[..., 4:5]
-        noobj_mask = 1.0 - obj_mask
+        ignore_mask = ignore_mask if ignore_mask is not None else torch.zeros_like(obj_mask)
+        noobj_mask = (1.0 - obj_mask) * (1.0 - ignore_mask.unsqueeze(-1))
 
         # Only compute IoU on positive locations to avoid NaNs from padded or empty boxes
         pos_mask = obj_mask.squeeze(-1) > 0
@@ -611,6 +617,8 @@ def train_epoch(model, loader, optimizer, scheduler, device, anchors, loss_fn):
     model.train()
     total_loss = 0
     logs = []
+    pos_counts = []
+    box_hw = []
     for step, (imgs, boxes, labels) in enumerate(loader, 1):
         imgs = imgs.to(device)
         boxes = boxes.to(device)
@@ -618,7 +626,9 @@ def train_epoch(model, loader, optimizer, scheduler, device, anchors, loss_fn):
         optimizer.zero_grad()
         raw = model(imgs)
         grid = raw.shape[-1]
-        targets = build_targets(boxes, labels, anchors, grid, len(C.BCCD_CLASSES))
+        targets, ignore_mask = build_targets(
+            boxes, labels, anchors, grid, len(C.BCCD_CLASSES), ignore_thresh=C.BCCD_IGNORE_IOU
+        )
 
         raw = raw.view(
             imgs.size(0), len(anchors), 5 + len(C.BCCD_CLASSES), grid, grid
@@ -642,15 +652,22 @@ def train_epoch(model, loader, optimizer, scheduler, device, anchors, loss_fn):
         pred_boxes = torch.stack([bx, by, bw, bh], dim=-1)
 
         preds = torch.cat([pred_boxes, pred_obj, pred_cls], dim=-1)
-        loss, detail = loss_fn(preds, targets)
+        loss, detail = loss_fn(preds, targets, ignore_mask)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
         scheduler.step()
         total_loss += loss.item() * imgs.size(0)
         logs.append(detail)
+        pos_counts.append(float(targets[..., 4].sum().item()))
+        valid_hw = (boxes[..., 2:] - boxes[..., :2]).clamp(min=0)
+        mask_hw = valid_hw.sum(dim=-1) > 0
+        if mask_hw.any():
+            box_hw.append(valid_hw[mask_hw].mean(dim=0).cpu())
     avg_loss = total_loss / len(loader.dataset)
-    return avg_loss, logs
+    pos_avg = float(torch.tensor(pos_counts).mean()) if pos_counts else 0.0
+    box_mean = torch.stack(box_hw).mean(dim=0).tolist() if box_hw else [0.0, 0.0]
+    return avg_loss, logs, pos_avg, box_mean
 
 
 def evaluate(model, loader, device, anchors):
@@ -678,7 +695,9 @@ def evaluate_loss(model, loader, device, anchors, loss_fn):
             labels = labels.to(device)
             raw = model(imgs)
             grid = raw.shape[-1]
-            targets = build_targets(boxes, labels, anchors, grid, len(C.BCCD_CLASSES))
+            targets, ignore_mask = build_targets(
+                boxes, labels, anchors, grid, len(C.BCCD_CLASSES), ignore_thresh=C.BCCD_IGNORE_IOU
+            )
 
             raw = raw.view(
                 imgs.size(0), len(anchors), 5 + len(C.BCCD_CLASSES), grid, grid
@@ -701,7 +720,7 @@ def evaluate_loss(model, loader, device, anchors, loss_fn):
             bh = (pred_wh[..., 1] * anchor_h) / C.IMAGE_SIZE
             pred_boxes = torch.stack([bx, by, bw, bh], dim=-1)
             preds = torch.cat([pred_boxes, pred_obj, pred_cls], dim=-1)
-            loss, _ = loss_fn(preds, targets)
+            loss, _ = loss_fn(preds, targets, ignore_mask)
             total_loss += loss.item() * imgs.size(0)
     return total_loss / len(loader.dataset)
 
@@ -788,11 +807,15 @@ def prepare_dataloaders():
     # Anchor auto-fit using training split to avoid target/pred mismatch on BCCD scale
     box_wh = []
     for s in samples:
+        scale_x = C.IMAGE_SIZE / float(max(1, s.size[0]))
+        scale_y = C.IMAGE_SIZE / float(max(1, s.size[1]))
         wh = (s.boxes[:, 2:] - s.boxes[:, :2])
-        box_wh.append(wh)
+        wh_scaled = np.stack([wh[:, 0] * scale_x, wh[:, 1] * scale_y], axis=-1)
+        box_wh.append(wh_scaled)
     box_wh_all = np.concatenate(box_wh, axis=0) if box_wh else np.zeros((0, 2))
-    fitted_anchors = _kmeans_anchors(box_wh_all, k=len(C.BCCD_ANCHORS))
-    anchors = [(max(a[0], 4.0), max(a[1], 4.0)) for a in fitted_anchors]
+    fitted_anchors = _kmeans_anchors(box_wh_all, k=C.BCCD_KMEANS_K, iters=C.BCCD_KMEANS_ITERS)
+    fitted_anchors = sorted(fitted_anchors, key=lambda x: x[0] * x[1])
+    anchors = [(max(a[0], 4.0), max(a[1], 4.0)) for a in fitted_anchors[: len(C.BCCD_ANCHORS)]]
 
     random.seed(C.BCCD_SEED)
     random.shuffle(samples)
@@ -896,7 +919,7 @@ def run_training():
         visualize_samples(train_set, C.BCCD_VIS_DIR / "train_samples.png", max_samples=C.BCCD_PLOTS_SAMPLES)
 
     for epoch in range(start_epoch, C.BCCD_EPOCHS):
-        train_loss, logs = train_epoch(model, train_loader, optimizer, scheduler, device, anchors, loss_fn)
+        train_loss, logs, pos_avg, box_mean = train_epoch(model, train_loader, optimizer, scheduler, device, anchors, loss_fn)
         val_loss = evaluate_loss(model, val_loader, device, anchors, loss_fn)
         val_mae, val_iou = evaluate(model, val_loader, device, anchors)
         history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss, "mae": val_mae, "iou": val_iou})
@@ -904,7 +927,10 @@ def run_training():
         if val_iou > best_iou:
             best_iou = val_iou
             save_checkpoint(model, optimizer, scheduler, epoch, best=True)
-        print(f"[Epoch {epoch+1}] train_loss={train_loss:.4f} val_mae={val_mae:.4f} val_iou={val_iou:.4f}")
+        print(
+            f"[Epoch {epoch+1}] train_loss={train_loss:.4f} val_mae={val_mae:.4f} "
+            f"val_iou={val_iou:.4f} pos/grid={pos_avg:.2f} mean_hw={box_mean}"
+        )
     plot_curves(history, C.BCCD_TRAIN_CURVE, C.BCCD_METRIC_IMG)
 
     model.load_state_dict(torch.load(C.BCCD_BEST_CKPT, map_location=device)["model"])
