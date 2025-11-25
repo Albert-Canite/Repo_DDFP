@@ -247,6 +247,14 @@ def _load_csv(anno_path: Path) -> List[DetectionSample]:
 
 
 def load_bccd_samples() -> List[DetectionSample]:
+    if not C.BCCD_IMG_DIR.exists():
+        raise FileNotFoundError(
+            f"Image directory not found: {C.BCCD_IMG_DIR}. Please verify the path matches the Kaggle archive (see screenshot)."
+        )
+    if not any(C.BCCD_IMG_DIR.iterdir()):
+        raise FileNotFoundError(
+            f"No images detected in {C.BCCD_IMG_DIR}. Ensure the PNG files are placed directly under the images directory."
+        )
     # Priority: COCO JSON, VOC XML folder, CSV fallback
     if C.BCCD_ANNO_DIR.exists() and C.BCCD_ANNO_DIR.is_dir():
         coco_files = list(C.BCCD_ANNO_DIR.glob("*.json"))
@@ -815,7 +823,10 @@ def prepare_dataloaders():
     box_wh_all = np.concatenate(box_wh, axis=0) if box_wh else np.zeros((0, 2))
     fitted_anchors = _kmeans_anchors(box_wh_all, k=C.BCCD_KMEANS_K, iters=C.BCCD_KMEANS_ITERS)
     fitted_anchors = sorted(fitted_anchors, key=lambda x: x[0] * x[1])
-    anchors = [(max(a[0], 4.0), max(a[1], 4.0)) for a in fitted_anchors[: len(C.BCCD_ANCHORS)]]
+    anchors = [(max(a[0], 4.0), max(a[1], 4.0)) for a in fitted_anchors]
+    print(
+        f"[Data] found {len(samples)} labeled images at {C.BCCD_IMG_DIR} | anchors (k={C.BCCD_KMEANS_K}): {anchors}"
+    )
 
     random.seed(C.BCCD_SEED)
     random.shuffle(samples)
@@ -934,6 +945,8 @@ def run_training():
     plot_curves(history, C.BCCD_TRAIN_CURVE, C.BCCD_METRIC_IMG)
 
     model.load_state_dict(torch.load(C.BCCD_BEST_CKPT, map_location=device)["model"])
+    visualize_predictions(model, val_loader, device, anchors, suffix="val")
+    visualize_predictions(model, test_loader, device, anchors, suffix="test")
     test_mae, test_iou = evaluate(model, test_loader, device, anchors)
     print(f"[Test] MAE={test_mae:.4f} IoU={test_iou:.4f}")
 
@@ -1048,6 +1061,33 @@ def draw_pred(ax, pred, color, label):
         rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=1, edgecolor=color, facecolor="none")
         ax.add_patch(rect)
         ax.text(x1, y1, f"{label}-{C.BCCD_CLASSES[int(c)]}:{s:.2f}", color=color, fontsize=6)
+
+
+def visualize_predictions(model, loader, device, anchors, suffix: str = "val"):
+    model.eval()
+    C.BCCD_VIS_DIR.mkdir(parents=True, exist_ok=True)
+    with torch.no_grad():
+        for idx, (imgs, gt_boxes, gt_labels) in enumerate(loader):
+            if idx >= C.BCCD_PLOTS_SAMPLES:
+                break
+            preds = model(imgs.to(device))
+            outputs = decode_predictions(preds.cpu(), anchors, C.BCCD_SCORE_THRESH)
+            img_np = imgs[0].permute(1, 2, 0).numpy()
+            fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+            ax.imshow(img_np)
+            draw_pred(ax, outputs[0], "lime", "Pred")
+            for box, cls in zip(gt_boxes[0], gt_labels[0]):
+                if cls < 0:
+                    continue
+                x1, y1, x2, y2 = (box * C.IMAGE_SIZE).numpy()
+                rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=1, edgecolor="yellow", facecolor="none")
+                ax.add_patch(rect)
+                ax.text(x1, y1, f"GT-{C.BCCD_CLASSES[int(cls)]}", color="yellow", fontsize=6)
+            ax.axis("off")
+            fig.tight_layout()
+            out_path = C.BCCD_VIS_DIR / f"post_train_{suffix}_{idx}.png"
+            fig.savefig(out_path, dpi=150)
+            plt.close(fig)
 
 
 def save_tracking(preds, gts, path: Path):
