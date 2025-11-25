@@ -431,7 +431,7 @@ class YoloTiny(nn.Module):
 
 
 def _prepare_grid_and_anchors(
-    device: torch.device, anchors: List[Tuple[int, int]], grid: int
+    device: torch.device, anchors: List[Tuple[float, float]], grid: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """Create mesh-grid and anchor tensors on the correct device.
 
@@ -484,11 +484,21 @@ def _cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
 def build_targets(
     boxes: torch.Tensor,
     labels: torch.Tensor,
-    anchors: List[Tuple[int, int]],
+    anchors: List[Tuple[float, float]],
     grid_size: int,
     num_classes: int,
     ignore_thresh: float = 0.5,
+    neighbor_range: int = 0,
+    debug: bool = False,
 ):
+    """YOLO-style target assignment that only marks the best anchor as positive.
+
+    Each GT chooses its single best-IoU anchor. That anchor is marked positive at
+    the GT's grid cell (and optionally a 1-cell neighbourhood). Non-best anchors
+    whose IoU exceeds ``ignore_thresh`` are masked out of the negative loss via
+    ``ignore_mask``; everything else remains negative.
+    """
+
     device = boxes.device
     bs = boxes.shape[0]
     num_anchors = len(anchors)
@@ -497,36 +507,65 @@ def build_targets(
     anchor_tensor = torch.tensor(anchors, device=device, dtype=torch.float32)
 
     for b in range(bs):
-        for box, cls in zip(boxes[b], labels[b]):
-            if box.numel() == 0 or cls < 0:
-                continue
+        valid_gt_mask = (labels[b] >= 0) & ((boxes[b].sum(dim=-1)) > 0)
+        valid_indices = valid_gt_mask.nonzero(as_tuple=False).squeeze(-1)
+
+        for idx in valid_indices:
+            box = boxes[b, idx]
+            cls = int(labels[b, idx].item())
             cx = 0.5 * (box[0] + box[2])
             cy = 0.5 * (box[1] + box[3])
             bw = (box[2] - box[0])
             bh = (box[3] - box[1])
             if bw <= 0 or bh <= 0:
                 continue
+
             gi = int(cx * grid_size)
             gj = int(cy * grid_size)
-            if gi >= grid_size or gj >= grid_size:
+            if gi < 0 or gj < 0 or gi >= grid_size or gj >= grid_size:
                 continue
-            box_wh = torch.tensor([bw * C.IMAGE_SIZE, bh * C.IMAGE_SIZE], device=device)
-            anchor_wh = anchor_tensor
-            iou = bbox_wh_iou(box_wh[None], anchor_wh).squeeze(0)
-            order = torch.argsort(iou, descending=True)
-            placed = False
-            for idx_anchor in order[: min(3, num_anchors)]:  # allow multiple boxes per cell via different anchors
-                if targets[b, idx_anchor, gj, gi, 4] == 0:
-                    targets[b, idx_anchor, gj, gi, 0:4] = torch.tensor(
-                        [cx, cy, bw, bh], device=device
-                    )
-                    targets[b, idx_anchor, gj, gi, 4] = 1.0
-                    targets[b, idx_anchor, gj, gi, 5 + cls] = 1.0
-                    placed = True
-                    break
 
-            if placed:
-                ignore_mask[b, :, gj, gi] = torch.where(iou > ignore_thresh, 1.0, ignore_mask[b, :, gj, gi])
+            box_wh = torch.tensor([bw * C.IMAGE_SIZE, bh * C.IMAGE_SIZE], device=device)
+            iou_per_anchor = bbox_wh_iou(box_wh[None], anchor_tensor).squeeze(0)
+            best_anchor = int(torch.argmax(iou_per_anchor).item())
+
+            offsets = [(0, 0)]
+            if neighbor_range > 0:
+                for dy in range(-neighbor_range, neighbor_range + 1):
+                    for dx in range(-neighbor_range, neighbor_range + 1):
+                        if dx == 0 and dy == 0:
+                            continue
+                        offsets.append((dy, dx))
+
+            for dy, dx in offsets:
+                gj_off = gj + dy
+                gi_off = gi + dx
+                if gj_off < 0 or gi_off < 0 or gj_off >= grid_size or gi_off >= grid_size:
+                    continue
+
+                targets[b, best_anchor, gj_off, gi_off, 0:4] = torch.tensor(
+                    [cx, cy, bw, bh], device=device
+                )
+                targets[b, best_anchor, gj_off, gi_off, 4] = 1.0
+                targets[b, best_anchor, gj_off, gi_off, 5 + cls] = 1.0
+
+                for anchor_idx in range(num_anchors):
+                    if anchor_idx == best_anchor:
+                        continue
+                    if iou_per_anchor[anchor_idx] > ignore_thresh:
+                        ignore_mask[b, anchor_idx, gj_off, gi_off] = 1.0
+
+        if debug:
+            obj_mask = targets[b, :, :, :, 4]
+            noobj_mask = (1.0 - obj_mask) * (1.0 - ignore_mask[b])
+            grid_elems = grid_size * grid_size * num_anchors
+            pos_ratio = obj_mask.sum().item() / float(max(1, grid_elems))
+            print(
+                f"[Assign stats] img={b} gt={int(valid_indices.numel())} obj_mask={int(obj_mask.sum().item())} "
+                f"noobj_mask={int(noobj_mask.sum().item())} ignore_mask={int(ignore_mask[b].sum().item())} "
+                f"pos/grid={pos_ratio*100:.2f}%"
+            )
+
     return targets, ignore_mask
 
 
@@ -576,6 +615,42 @@ def bbox_ciou(pred, target):
     return ciou
 
 
+def bbox_ciou_xyxy(pred_xyxy: torch.Tensor, tgt_xyxy: torch.Tensor) -> torch.Tensor:
+    px1, py1, px2, py2 = pred_xyxy.unbind(-1)
+    tx1, ty1, tx2, ty2 = tgt_xyxy.unbind(-1)
+
+    eps = 1e-7
+    pw = (px2 - px1).clamp(min=eps)
+    ph = (py2 - py1).clamp(min=eps)
+    tw = (tx2 - tx1).clamp(min=eps)
+    th = (ty2 - ty1).clamp(min=eps)
+
+    inter_x1 = torch.max(px1, tx1)
+    inter_y1 = torch.max(py1, ty1)
+    inter_x2 = torch.min(px2, tx2)
+    inter_y2 = torch.min(py2, ty2)
+
+    inter = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
+    union = pw * ph + tw * th - inter + eps
+    iou = inter / union
+
+    pred_cx = (px1 + px2) / 2
+    pred_cy = (py1 + py2) / 2
+    tgt_cx = (tx1 + tx2) / 2
+    tgt_cy = (ty1 + ty2) / 2
+
+    cw = torch.max(px2, tx2) - torch.min(px1, tx1)
+    ch = torch.max(py2, ty2) - torch.min(py1, ty1)
+    c2 = cw ** 2 + ch ** 2 + eps
+
+    rho2 = (pred_cx - tgt_cx) ** 2 + (pred_cy - tgt_cy) ** 2
+    v = (4 / (math.pi ** 2)) * torch.pow(torch.atan(tw / th) - torch.atan(pw / ph), 2)
+    with torch.no_grad():
+        alpha = v / torch.clamp(1 - iou + v, min=1e-6)
+    ciou = iou - (rho2 / c2 + alpha * v)
+    return ciou
+
+
 class DetectionLoss(nn.Module):
     def __init__(self, num_classes: int):
         super().__init__()
@@ -590,11 +665,16 @@ class DetectionLoss(nn.Module):
         # Only compute IoU on positive locations to avoid NaNs from padded or empty boxes
         pos_mask = obj_mask.squeeze(-1) > 0
         if pos_mask.any():
-            box_pred = preds[..., 0:4][pos_mask]
-            box_tgt = targets[..., 0:4][pos_mask]
-            ciou_pos = bbox_ciou(box_pred, box_tgt).clamp(min=0.0)
-            box_loss = (1.0 - ciou_pos)
-            mean_ciou = ciou_pos.mean()
+            box_pred_cxcywh = preds[..., 0:4][pos_mask]
+            box_tgt_cxcywh = targets[..., 0:4][pos_mask]
+
+            box_pred_xyxy = _cxcywh_to_xyxy(box_pred_cxcywh)
+            box_tgt_xyxy = _cxcywh_to_xyxy(box_tgt_cxcywh)
+
+            ciou_pos_xyxy = bbox_ciou_xyxy(box_pred_xyxy, box_tgt_xyxy).clamp(min=0.0)
+
+            box_loss = (1.0 - ciou_pos_xyxy)
+            mean_ciou = ciou_pos_xyxy.mean()
         else:
             box_loss = torch.zeros(1, device=preds.device)
             mean_ciou = torch.tensor(0.0, device=preds.device)
@@ -693,27 +773,37 @@ def collate_fn(batch):
     return torch.stack(imgs, 0), torch.stack(padded_boxes, 0), torch.stack(padded_labels, 0)
 
 
-def _kmeans_anchors(box_wh: np.ndarray, k: int = 3, iters: int = 25) -> List[Tuple[int, int]]:
+def _kmeans_anchors(box_wh: List[Tuple[float, float]], k: int = 3, iters: int = 25) -> List[Tuple[float, float]]:
     """Simple k-means on width/height (in pixels) to adapt anchors to dataset scale."""
-    if box_wh.shape[0] < k:
-        return [(12, 12), (24, 24), (36, 36)]
-    # initialize centers by random pick
-    centers = box_wh[np.random.choice(box_wh.shape[0], k, replace=False)]
+
+    if len(box_wh) < k:
+        return C.BCCD_ANCHORS
+
+    rng = np.random.default_rng(C.BCCD_SEED)
+    centers = [box_wh[i] for i in rng.choice(len(box_wh), size=k, replace=False)]
+
     for _ in range(iters):
-        dists = np.linalg.norm(box_wh[:, None, :] - centers[None, :, :], axis=-1)
-        assign = np.argmin(dists, axis=1)
+        clusters = [[] for _ in range(k)]
+        for w, h in box_wh:
+            dists = [((w - c[0]) ** 2 + (h - c[1]) ** 2) for c in centers]
+            idx = int(np.argmin(dists))
+            clusters[idx].append((w, h))
+
         new_centers = []
-        for i in range(k):
-            cluster = box_wh[assign == i]
-            if len(cluster) == 0:
+        for i, cluster in enumerate(clusters):
+            if not cluster:
                 new_centers.append(centers[i])
             else:
-                new_centers.append(cluster.mean(axis=0))
-        new_centers = np.stack(new_centers)
-        if np.allclose(new_centers, centers, atol=1e-3):
+                mw = float(np.mean([p[0] for p in cluster]))
+                mh = float(np.mean([p[1] for p in cluster]))
+                new_centers.append((mw, mh))
+
+        if all(abs(new_centers[i][0] - centers[i][0]) < 1e-3 and abs(new_centers[i][1] - centers[i][1]) < 1e-3 for i in range(k)):
+            centers = new_centers
             break
         centers = new_centers
-    return [(float(c[0]), float(c[1])) for c in centers]
+
+    return centers
 
 
 def visualize_samples(dataset: Dataset, path: Path, max_samples: int = 4):
@@ -767,7 +857,14 @@ def train_epoch(model, loader, optimizer, scheduler, device, anchors, loss_fn):
         raw = model(imgs)
         pred_boxes, pred_obj, pred_cls, grid = _decode_raw(raw, anchors)
         targets, ignore_mask = build_targets(
-            boxes, labels, anchors, grid, len(C.BCCD_CLASSES), ignore_thresh=C.BCCD_IGNORE_IOU
+            boxes,
+            labels,
+            anchors,
+            grid,
+            len(C.BCCD_CLASSES),
+            ignore_thresh=C.BCCD_IGNORE_IOU,
+            neighbor_range=0,
+            debug=False,
         )
         preds = torch.cat([pred_boxes, pred_obj, pred_cls], dim=-1)
         loss, detail = loss_fn(preds, targets, ignore_mask)
@@ -814,7 +911,14 @@ def evaluate_loss(model, loader, device, anchors, loss_fn):
             raw = model(imgs)
             pred_boxes, pred_obj, pred_cls, grid = _decode_raw(raw, anchors)
             targets, ignore_mask = build_targets(
-                boxes, labels, anchors, grid, len(C.BCCD_CLASSES), ignore_thresh=C.BCCD_IGNORE_IOU
+                boxes,
+                labels,
+                anchors,
+                grid,
+                len(C.BCCD_CLASSES),
+                ignore_thresh=C.BCCD_IGNORE_IOU,
+                neighbor_range=0,
+                debug=False,
             )
 
             preds = torch.cat([pred_boxes, pred_obj, pred_cls], dim=-1)
@@ -903,17 +1007,17 @@ def prepare_dataloaders():
             f"No labeled samples found. Check annotation file names and class labels at {C.BCCD_ANNO_DIR} or {C.BCCD_ANNO_CSV}."
         )
     # Anchor auto-fit using training split to avoid target/pred mismatch on BCCD scale
-    box_wh = []
+    box_wh: List[Tuple[float, float]] = []
     for s in samples:
         scale_x = C.IMAGE_SIZE / float(max(1, s.size[0]))
         scale_y = C.IMAGE_SIZE / float(max(1, s.size[1]))
         wh = (s.boxes[:, 2:] - s.boxes[:, :2])
-        wh_scaled = np.stack([wh[:, 0] * scale_x, wh[:, 1] * scale_y], axis=-1)
-        box_wh.append(wh_scaled)
-    box_wh_all = np.concatenate(box_wh, axis=0) if box_wh else np.zeros((0, 2))
-    fitted_anchors = _kmeans_anchors(box_wh_all, k=C.BCCD_KMEANS_K, iters=C.BCCD_KMEANS_ITERS)
+        for w, h in wh:
+            box_wh.append((float(w * scale_x), float(h * scale_y)))
+    fitted_anchors = _kmeans_anchors(box_wh, k=C.BCCD_KMEANS_K, iters=C.BCCD_KMEANS_ITERS)
     fitted_anchors = sorted(fitted_anchors, key=lambda x: x[0] * x[1])
     anchors = [(max(a[0], 4.0), max(a[1], 4.0)) for a in fitted_anchors]
+    C.BCCD_ANCHORS = anchors
     print(
         f"[Data] found {len(samples)} labeled images at {C.BCCD_IMG_DIR} | anchors (k={C.BCCD_KMEANS_K}): {anchors}"
     )
@@ -1038,10 +1142,7 @@ def run_training():
         if val_iou > best_iou:
             best_iou = val_iou
             save_checkpoint(model, optimizer, scheduler, epoch, best=True)
-        print(
-            f"[Epoch {epoch+1}] train_loss={train_loss:.4f} val_mae={val_mae:.4f} "
-            f"val_iou={val_iou:.4f} pos/grid={pos_avg:.2f} mean_hw={box_mean}"
-        )
+        print(f"Epoch {epoch+1}: train_loss={train_loss:.4f} val_mae={val_mae:.4f} val_iou={val_iou:.4f}")
     plot_curves(history, C.BCCD_TRAIN_CURVE, C.BCCD_METRIC_IMG)
 
     model.load_state_dict(torch.load(C.BCCD_BEST_CKPT, map_location=device)["model"])

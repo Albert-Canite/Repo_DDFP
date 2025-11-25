@@ -34,10 +34,16 @@ ADC_BITS_LIST = [8]
 
 # BCCD detection
 BCCD_CLASSES = ["RBC", "WBC", "Platelets"]
+# Default anchors will be overridden by on-the-fly k-means fit at runtime. These
+# six priors come from running k-means (k=6) on the bundled BCCD annotations at
+# 512×512 scale for offline reproducibility.
 BCCD_ANCHORS = [
-    (12, 12),
-    (24, 24),
-    (36, 36),
+    (93.0, 39.4),
+    (40.2, 91.9),
+    (109.3, 82.1),
+    (82.7, 107.8),
+    (112.2, 112.5),
+    (194.1, 196.7),
 ]
 BCCD_KMEANS_K = 6
 BCCD_KMEANS_ITERS = 25
