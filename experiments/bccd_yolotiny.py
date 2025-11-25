@@ -599,8 +599,9 @@ def decode_predictions(
 
 
 def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: float):
+    device = boxes.device
     if boxes.numel() == 0:
-        return torch.tensor([], dtype=torch.long)
+        return torch.tensor([], dtype=torch.long, device=device)
     x1, y1, x2, y2 = boxes.unbind(-1)
     areas = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
     order = scores.argsort(descending=True)
@@ -619,7 +620,7 @@ def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: float):
         iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-8)
         idx = (iou <= iou_thresh).nonzero(as_tuple=False).squeeze(1)
         order = order[idx + 1]
-    return torch.tensor(keep, dtype=torch.long)
+    return torch.tensor(keep, dtype=torch.long, device=device)
 
 
 def collate_fn(batch):
