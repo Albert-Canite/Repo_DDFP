@@ -513,20 +513,20 @@ def build_targets(
             box_wh = torch.tensor([bw * C.IMAGE_SIZE, bh * C.IMAGE_SIZE], device=device)
             anchor_wh = anchor_tensor
             iou = bbox_wh_iou(box_wh[None], anchor_wh).squeeze(0)
-            order = torch.argsort(iou, descending=True)
-            placed = False
-            for idx_anchor in order[: min(3, num_anchors)]:  # allow multiple boxes per cell via different anchors
-                if targets[b, idx_anchor, gj, gi, 4] == 0:
-                    targets[b, idx_anchor, gj, gi, 0:4] = torch.tensor(
-                        [cx, cy, bw, bh], device=device
-                    )
-                    targets[b, idx_anchor, gj, gi, 4] = 1.0
-                    targets[b, idx_anchor, gj, gi, 5 + cls] = 1.0
-                    placed = True
-                    break
+            best_anchor = int(torch.argmax(iou).item())
 
-            if placed:
-                ignore_mask[b, :, gj, gi] = torch.where(iou > ignore_thresh, 1.0, ignore_mask[b, :, gj, gi])
+            if targets[b, best_anchor, gj, gi, 4] == 0:
+                targets[b, best_anchor, gj, gi, 0:4] = torch.tensor(
+                    [cx, cy, bw, bh], device=device
+                )
+                targets[b, best_anchor, gj, gi, 4] = 1.0
+                targets[b, best_anchor, gj, gi, 5 + cls] = 1.0
+
+            high_iou = (iou > ignore_thresh).float()
+            ignore_mask[b, :, gj, gi] = torch.where(
+                high_iou > 0, 1.0, ignore_mask[b, :, gj, gi]
+            )
+            ignore_mask[b, best_anchor, gj, gi] = 0.0
     return targets, ignore_mask
 
 

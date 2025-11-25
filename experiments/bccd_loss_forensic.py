@@ -25,6 +25,87 @@ def _tensor_stats(name: str, tensor: torch.Tensor, max_items: int = 10):
     print(f"{name} shape={tuple(tensor.shape)} first_{len(subset)}={subset}")
 
 
+def _legacy_build_targets(boxes, labels, anchors, grid_size, num_classes, ignore_thresh=0.5):
+    device = boxes.device
+    bs = boxes.shape[0]
+    num_anchors = len(anchors)
+    targets = torch.zeros(bs, num_anchors, grid_size, grid_size, 5 + num_classes, device=device)
+    ignore_mask = torch.zeros(bs, num_anchors, grid_size, grid_size, device=device)
+    anchor_tensor = torch.tensor(anchors, device=device, dtype=torch.float32)
+
+    for b in range(bs):
+        for box, cls in zip(boxes[b], labels[b]):
+            if box.numel() == 0 or cls < 0:
+                continue
+            cx = 0.5 * (box[0] + box[2])
+            cy = 0.5 * (box[1] + box[3])
+            bw = (box[2] - box[0])
+            bh = (box[3] - box[1])
+            if bw <= 0 or bh <= 0:
+                continue
+            gi = int(cx * grid_size)
+            gj = int(cy * grid_size)
+            if gi >= grid_size or gj >= grid_size:
+                continue
+            box_wh = torch.tensor([bw * C.IMAGE_SIZE, bh * C.IMAGE_SIZE], device=device)
+            anchor_wh = anchor_tensor
+            iou = bccd.bbox_wh_iou(box_wh[None], anchor_wh).squeeze(0)
+            order = torch.argsort(iou, descending=True)
+            placed = False
+            for idx_anchor in order[: min(3, num_anchors)]:
+                if targets[b, idx_anchor, gj, gi, 4] == 0:
+                    targets[b, idx_anchor, gj, gi, 0:4] = torch.tensor(
+                        [cx, cy, bw, bh], device=device
+                    )
+                    targets[b, idx_anchor, gj, gi, 4] = 1.0
+                    targets[b, idx_anchor, gj, gi, 5 + cls] = 1.0
+                    placed = True
+                    break
+            if placed:
+                ignore_mask[b, :, gj, gi] = torch.where(iou > ignore_thresh, 1.0, ignore_mask[b, :, gj, gi])
+    return targets, ignore_mask
+
+
+def _assignment_stats(name, targets, ignore_mask, boxes, labels, anchors, show_map: bool = False):
+    obj_mask = targets[..., 4]
+    noobj_mask = (1.0 - obj_mask) * (1.0 - ignore_mask)
+    grid = targets.shape[2]
+    grid_cells = float(grid * grid)
+    print(f"===== {name} assignment stats =====")
+    for b in range(targets.shape[0]):
+        valid = (labels[b] >= 0) & ((boxes[b].sum(dim=1)) > 0)
+        gt_count = int(valid.sum().item())
+        pos = int(obj_mask[b].sum().item())
+        noobj = int((noobj_mask[b] > 0).sum().item())
+        ign = int((ignore_mask[b] > 0).sum().item())
+        ratio = (pos / grid_cells) * 100.0
+        print(
+            f"img{b}: gt={gt_count} obj_mask={pos} noobj_mask={noobj} ignore_mask={ign} pos/grid={ratio:.2f}%"
+        )
+
+    if show_map:
+        for b in range(targets.shape[0]):
+            valid_idx = ((labels[b] >= 0) & ((boxes[b].sum(dim=1)) > 0)).nonzero(as_tuple=False)
+            if valid_idx.numel() == 0:
+                continue
+            idx = int(valid_idx[0])
+            box = boxes[b, idx]
+            cx = 0.5 * (box[0] + box[2])
+            cy = 0.5 * (box[1] + box[3])
+            bw = (box[2] - box[0])
+            bh = (box[3] - box[1])
+            gi = int(cx * grid)
+            gj = int(cy * grid)
+            box_wh = torch.tensor([bw * C.IMAGE_SIZE, bh * C.IMAGE_SIZE], device=targets.device)
+            anchor_wh = torch.tensor(anchors, device=targets.device, dtype=torch.float32)
+            iou = bccd.bbox_wh_iou(box_wh[None], anchor_wh).squeeze(0)
+            best_anchor = int(torch.argmax(iou).item())
+            pos_map = obj_mask[b, best_anchor].int().cpu().numpy()
+            print(f"Positive map for img{b} GT#{idx} (anchor={best_anchor}, cell=({gj},{gi})):")
+            print(pos_map)
+            break
+
+
 def _print_objectness_distribution(scores: torch.Tensor, pos_mask: torch.Tensor, neg_mask: torch.Tensor):
     pos_scores = scores[pos_mask]
     neg_scores = scores[neg_mask]
@@ -110,6 +191,12 @@ def main():
     targets, ignore_mask = bccd.build_targets(
         boxes, labels, anchors, grid, len(C.BCCD_CLASSES), ignore_thresh=C.BCCD_IGNORE_IOU
     )
+    legacy_targets, legacy_ignore = _legacy_build_targets(
+        boxes, labels, anchors, grid, len(C.BCCD_CLASSES), ignore_thresh=C.BCCD_IGNORE_IOU
+    )
+
+    _assignment_stats("Legacy (pre-fix)", legacy_targets, legacy_ignore, boxes, labels, anchors, show_map=False)
+    _assignment_stats("Fixed (best-anchor)", targets, ignore_mask, boxes, labels, anchors, show_map=True)
     preds = torch.cat([pred_boxes, pred_obj, pred_cls], dim=-1)
 
     loss, detail = loss_fn(preds, targets, ignore_mask)
