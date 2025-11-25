@@ -612,8 +612,26 @@ def build_targets(
 
 
 def bbox_wh_iou(box1, box2):
-    b1w, b1h = box1[..., 0], box1[..., 1]
-    b2w, b2h = box2[..., 0], box2[..., 1]
+    """Pairwise IoU between width/height vectors.
+
+    Args:
+        box1: Tensor[..., 2] widths/heights.
+        box2: Tensor[..., 2] widths/heights.
+
+    Returns:
+        Tensor with pairwise IoU broadcast to shape (..., box1, box2).
+    """
+
+    if box1.ndim == 1:
+        box1 = box1.unsqueeze(0)
+    if box2.ndim == 1:
+        box2 = box2.unsqueeze(0)
+
+    b1 = box1.unsqueeze(-2)  # [..., N, 1, 2]
+    b2 = box2.unsqueeze(-3)  # [..., 1, M, 2]
+    b1w, b1h = b1[..., 0], b1[..., 1]
+    b2w, b2h = b2[..., 0], b2[..., 1]
+
     inter = torch.min(b1w, b2w) * torch.min(b1h, b2h)
     union = (b1w * b1h) + (b2w * b2h) - inter + 1e-8
     return inter / union
