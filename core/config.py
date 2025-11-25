@@ -56,7 +56,9 @@ BCCD_NOOBJ_WEIGHT = 0.1
 BCCD_NOOBJ_OBJ_THRESH = 0.7
 BCCD_FOCAL_GAMMA = 2.0
 BCCD_FOCAL_ALPHA = 0.25
-BCCD_SCORE_TOPK = 15
+# Keep enough pre-NMS candidates so that low-scoring but spatially diverse boxes
+# are not dropped prematurely during debugging/early training.
+BCCD_SCORE_TOPK = 200
 BCCD_BATCH_SIZE = 4
 BCCD_NUM_WORKERS = 2
 BCCD_LR = 2e-3

@@ -403,10 +403,11 @@ class YoloTiny(nn.Module):
             padding=0,
             bias=True,
         )
-        # Initialize objectness bias low to reduce early false positives and separate pos/neg logits
+        # Initialize objectness bias moderately low to reduce early false positives
+        # without suppressing all predictions.
         with torch.no_grad():
             bias = self.head.bias.view(len(anchors), 5 + num_classes)
-            bias[:, 4] = -3.0
+            bias[:, 4] = -2.0
             self.head.bias.copy_(bias.view(-1))
         gn_meta.append(None)
         strides.append(1)
@@ -781,6 +782,7 @@ def decode_predictions(
     anchors: List[Tuple[int, int]],
     score_thresh: float,
     max_boxes: int = C.BCCD_MAX_BOXES,
+    return_stats: bool = False,
 ):
     boxes_cxcywh, obj_logit, cls_logit, _ = _decode_raw(preds, anchors, clamp=True)
     pred_obj = torch.sigmoid(obj_logit.squeeze(-1))
@@ -791,15 +793,13 @@ def decode_predictions(
     scores = scores * pred_obj
 
     outputs = []
+    stats = []
     for b in range(preds.size(0)):
         boxes_flat = boxes_xyxy[b].reshape(-1, 4)
         scores_flat = scores[b].reshape(-1)
         cls_flat = cls_idx[b].reshape(-1)
 
         keep_mask = scores_flat > score_thresh
-        if keep_mask.sum() == 0:
-            outputs.append((torch.empty((0, 4)), torch.empty((0,), dtype=torch.long), torch.empty((0,))))
-            continue
         select_idx = keep_mask.nonzero(as_tuple=False).squeeze(1)
         if select_idx.numel() > C.BCCD_SCORE_TOPK:
             # Pre-filter by top-K scores to avoid keeping dozens of low-quality boxes per image
@@ -817,7 +817,55 @@ def decode_predictions(
             sorted_idx = torch.argsort(keep_scores, descending=True)
             keep = keep[sorted_idx][: max_boxes]
         outputs.append((b_boxes[keep], b_cls[keep], b_scores[keep]))
+
+        if return_stats:
+            stats.append(
+                {
+                    "total": int(boxes_flat.shape[0]),
+                    "above_thresh": int(keep_mask.sum().item()),
+                    "after_topk": int(select_idx.numel()),
+                    "after_nms": int(keep.numel()),
+                }
+            )
+    if return_stats:
+        return outputs, stats
     return outputs
+
+
+def _decode_diagnostics(
+    raw_preds: torch.Tensor,
+    anchors: List[Tuple[int, int]],
+    score_thresh: float,
+):
+    """Print decode path diagnostics to debug score suppression/clustering."""
+
+    with torch.no_grad():
+        boxes_cxcywh, obj_logit, cls_logit, grid = _decode_raw(raw_preds, anchors, clamp=True)
+
+        obj_log_flat = obj_logit.view(-1)
+        obj_sig_flat = torch.sigmoid(obj_log_flat)
+        cls_sig_flat = torch.sigmoid(cls_logit).reshape(-1, len(C.BCCD_CLASSES))
+        cls_max = cls_sig_flat.max(dim=1).values
+
+        def _stat(t):
+            return float(t.min()), float(t.mean()), float(t.max())
+
+        print(
+            f"[Decode dbg] grid={grid} anchors={len(anchors)} obj_logit(min/mean/max)={_stat(obj_log_flat)} "
+            f"obj_sig(min/mean/max)={_stat(obj_sig_flat)} cls_sig(max per entry min/mean/max)={_stat(cls_max)}"
+        )
+
+        outputs, stats = decode_predictions(raw_preds, anchors, score_thresh, return_stats=True)
+        outputs_no, stats_no = decode_predictions(raw_preds, anchors, 0.0, return_stats=True)
+
+        for i, st in enumerate(stats):
+            st0 = stats_no[i]
+            print(
+                f"[Decode dbg/img {i}] total={st['total']} >thr={st['above_thresh']} after_topk={st['after_topk']} after_nms={st['after_nms']} "
+                f"(thr={score_thresh}) | thr0 after_topk={st0['after_topk']} after_nms={st0['after_nms']}"
+            )
+
+        return outputs
 
 
 def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: float):
@@ -1313,6 +1361,17 @@ def run_training():
     best_iou = -1
     if start_epoch == 0:
         visualize_samples(train_set, C.BCCD_VIS_DIR / "train_samples.png", max_samples=C.BCCD_PLOTS_SAMPLES)
+
+    if os.environ.get("BCCD_DEBUG_DECODE", "0") == "1":
+        model.eval()
+        with torch.no_grad():
+            try:
+                imgs_dbg, _, _ = next(iter(val_loader))
+                imgs_dbg = imgs_dbg.to(device)
+                raw_dbg = model(imgs_dbg)
+                _decode_diagnostics(raw_dbg, anchors, C.BCCD_SCORE_THRESH)
+            except StopIteration:
+                pass
 
     for epoch in range(start_epoch, C.BCCD_EPOCHS):
         train_loss, logs, pos_avg, box_mean = train_epoch(
