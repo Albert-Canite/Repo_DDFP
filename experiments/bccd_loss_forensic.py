@@ -42,6 +42,10 @@ def _print_objectness_distribution(scores: torch.Tensor, pos_mask: torch.Tensor,
 def _find_best_matches(gt_boxes: torch.Tensor, pred_boxes: torch.Tensor):
     from experiments.bccd_yolotiny import box_iou_single
 
+    # Ensure both tensors are on the same device for fair IoU / error computation
+    device = pred_boxes.device
+    gt_boxes = gt_boxes.to(device)
+
     results = []
     for gt in gt_boxes:
         if gt.numel() == 0:
@@ -63,6 +67,7 @@ def _find_best_matches(gt_boxes: torch.Tensor, pred_boxes: torch.Tensor):
 def _match_gt_to_targets(gt: torch.Tensor, targets: torch.Tensor) -> List[Tuple[int, int, int]]:
     matches: List[Tuple[int, int, int]] = []
     pos = (targets[..., 4] > 0).nonzero(as_tuple=False)
+    gt = gt.to(targets.device)
     for idx in pos:
         a, j, i = idx.tolist()
         t = targets[a, j, i, 0:4]
