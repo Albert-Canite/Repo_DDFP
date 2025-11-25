@@ -64,6 +64,34 @@ class BCCDDataset(Dataset):
         boxes_norm[:, [1, 3]] /= h
         return boxes_norm
 
+    def _clean_boxes(self, boxes: np.ndarray, w: int, h: int) -> np.ndarray:
+        """
+        Clamp boxes to image bounds and drop degenerate entries.
+
+        When the upstream annotation contains malformed coordinates (e.g., x1>x2, negative
+        values, or values outside the image), training quickly collapses to predicting dense
+        grids of boxes. Sanitizing here prevents those corrupt labels from polluting the
+        target tensor and makes visualizations reliable.
+        """
+
+        if boxes.size == 0:
+            return boxes.astype(np.float32)
+
+        boxes = boxes.astype(np.float32)
+        # Ensure x1<x2 and y1<y2 before clamping
+        x1 = np.minimum(boxes[:, 0], boxes[:, 2])
+        x2 = np.maximum(boxes[:, 0], boxes[:, 2])
+        y1 = np.minimum(boxes[:, 1], boxes[:, 3])
+        y2 = np.maximum(boxes[:, 1], boxes[:, 3])
+
+        boxes_clean = np.stack([x1, y1, x2, y2], axis=-1)
+        boxes_clean[:, [0, 2]] = np.clip(boxes_clean[:, [0, 2]], 0, w)
+        boxes_clean[:, [1, 3]] = np.clip(boxes_clean[:, [1, 3]], 0, h)
+
+        # Drop boxes that become degenerate after clipping
+        valid = (boxes_clean[:, 2] - boxes_clean[:, 0] > 1.0) & (boxes_clean[:, 3] - boxes_clean[:, 1] > 1.0)
+        return boxes_clean[valid]
+
     def __getitem__(self, idx):
         sample = self.samples[idx]
         img = plt.imread(sample.path)
@@ -76,8 +104,11 @@ class BCCDDataset(Dataset):
             img = img / 255.0
         h, w, _ = img.shape
 
-        boxes = sample.boxes.copy()
+        boxes = self._clean_boxes(sample.boxes, w, h)
         labels = np.array(sample.labels, dtype=np.int64)
+        if boxes.shape[0] != len(labels):
+            # If some boxes were dropped, sync the labels to the remaining indices
+            labels = labels[: boxes.shape[0]]
 
         if self.augment:
             flip_flag = np.random.rand() < self.hflip_prob
@@ -607,11 +638,23 @@ def _kmeans_anchors(box_wh: np.ndarray, k: int = 3, iters: int = 25) -> List[Tup
 
 def visualize_samples(dataset: Dataset, path: Path, max_samples: int = 4):
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Always visualize deterministic, clean samples to avoid confusion from heavy augmentation
+    if isinstance(dataset, BCCDDataset) and dataset.augment:
+        dataset = BCCDDataset(dataset.samples, augment=False)
+
+    if len(dataset) == 0:
+        print(f"[Warn] No samples available for visualization at {path}")
+        return
+
     cols = min(max_samples, 2)
     rows = math.ceil(max_samples / cols)
     fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 6 * rows))
     axes = axes.flatten()
     for idx in range(max_samples):
+        if idx >= len(dataset):
+            axes[idx].axis("off")
+            continue
         img, boxes, labels = dataset[idx]
         ax = axes[idx]
         ax.imshow(img.permute(1, 2, 0))
