@@ -1,5 +1,11 @@
 # Repo_DDFP
+Repository root (unchanged): `/workspace/Repo_DDFP`.
 For reproducing the experiments of AnDi (https://www.nature.com/articles/s41928-024-01315-9)
+
+## Archive usage
+- The `archive/` folder is a static snapshot of the BCCD dataset (images and `annotations.csv`).
+- Scripts reference it with paths relative to the repo root (e.g., `archive/images/...`).
+- Keep the folder in place if you move or mount the repo; no external download is needed.
 
 ## RSNA 回归与 DDFP 对比流程概览
 - `experiments/rsna_regression.py` 先用 PyTorch 训练 YOLO-tiny 风格的全精度（FP32）单通道 CNN（`RegressionNet`），用 stride-2 卷积完成下采样并回归 512×512 胸片的肺炎框坐标。
