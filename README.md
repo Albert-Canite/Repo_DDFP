@@ -7,6 +7,16 @@ For reproducing the experiments of AnDi (https://www.nature.com/articles/s41928-
 - Scripts reference it with paths relative to the repo root (e.g., `archive/images/...`).
 - Keep the folder in place if you move or mount the repo; no external download is needed.
 
+## BCCD YOLO 检查要点（现状确认）
+- **坐标系统一**：数据加载即将标注框归一化到 0–1（原图尺寸除法 + clamp），训练/解码/评估都在同一归一化域内工作，格式在 `cxcywh↔xyxy` 间只通过 `_cxcywh_to_xyxy` 转换。【F:experiments/bccd_yolotiny.py†L64-L127】【F:experiments/bccd_yolotiny.py†L470-L502】【F:experiments/bccd_yolotiny.py†L700-L756】【F:experiments/bccd_yolotiny.py†L759-L800】
+- **网格与 GT 对齐**：GT 中心先 clamp 再按 `gi=int(cx*grid)`、`gj=int(cy*grid)` 投射到特征图，使用同一 `grid` 和锚尺寸计算 IoU，保证每个 GT 命中正确网格单元。【F:experiments/bccd_yolotiny.py†L512-L560】
+- **编码/解码一致性**：解码使用 `sigmoid(tx,ty)+grid` 与 `exp(tw,th)*anchor/IMAGE_SIZE`（可选 clamp 仅用于推理），与赋值/损失均在同一归一化尺度，`tw/th` 按 YOLO 约定指数放缩。【F:experiments/bccd_yolotiny.py†L470-L502】【F:experiments/bccd_yolotiny.py†L700-L756】
+- **锚框聚类与使用**：训练前对原始标注（未 resize）做 IoU 距离 k-means 得到 6 组锚，并统计 GT-IoU 覆盖率；聚类结果写回 `C.BCCD_ANCHORS`，训练/解码/可视化共用同一组锚。【F:experiments/bccd_yolotiny.py†L1143-L1183】【F:core/config.py†L18-L55】
+- **正样本分配**：按 GT-锚 IoU 排序取 Top-K(默认3) 过阈值者为正样本，可选邻域；其余高 IoU 仅进 ignore_mask，负样本用 noobj_mask 表示，策略与实现一致。【F:experiments/bccd_yolotiny.py†L512-L560】
+- **回归损失坐标空间**：仅对正样本在 xyxy 空间计算 CIoU（`bbox_ciou_xyxy`），避免混用 cxcywh/xyxy；分类/置信度损失在对应掩码上计算。【F:experiments/bccd_yolotiny.py†L700-L756】
+- **解码后再裁剪**：训练路径不对 cxcywh 强行 clamp，推理/可视化才在 `_decode_raw(..., clamp=True)` 与 `_cxcywh_to_xyxy(...).clamp(0,1)` 后裁剪，避免训练梯度被截断。【F:experiments/bccd_yolotiny.py†L470-L502】【F:experiments/bccd_yolotiny.py†L759-L800】
+- **得分/阈值与 NMS**：得分采用 `sigmoid(obj)*sigmoid(cls)`，阈值/Top-K/NMS 统一在 `decode_predictions` 内配置；低 obj 初始偏置与焦点缩放减少正负重叠，noobj 权重下调防止掩盖定位问题。【F:experiments/bccd_yolotiny.py†L759-L800】【F:core/config.py†L34-L73】
+
 ## RSNA 回归与 DDFP 对比流程概览
 - `experiments/rsna_regression.py` 先用 PyTorch 训练 YOLO-tiny 风格的全精度（FP32）单通道 CNN（`RegressionNet`），用 stride-2 卷积完成下采样并回归 512×512 胸片的肺炎框坐标。
 - 训练完成后，脚本用 FP32 模型在测试集上得到基准框（`run_network_fp32`），并把每层卷积核及其 stride/padding 导出到全局配置（`core.config.set_kernels` + `set_kernel_metadata`）。
