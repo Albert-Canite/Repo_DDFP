@@ -73,24 +73,7 @@ class BCCDDataset(Dataset):
         grids of boxes. Sanitizing here prevents those corrupt labels from polluting the
         target tensor and makes visualizations reliable.
         """
-
-        if boxes.size == 0:
-            return boxes.astype(np.float32)
-
-        boxes = boxes.astype(np.float32)
-        # Ensure x1<x2 and y1<y2 before clamping
-        x1 = np.minimum(boxes[:, 0], boxes[:, 2])
-        x2 = np.maximum(boxes[:, 0], boxes[:, 2])
-        y1 = np.minimum(boxes[:, 1], boxes[:, 3])
-        y2 = np.maximum(boxes[:, 1], boxes[:, 3])
-
-        boxes_clean = np.stack([x1, y1, x2, y2], axis=-1)
-        boxes_clean[:, [0, 2]] = np.clip(boxes_clean[:, [0, 2]], 0, w)
-        boxes_clean[:, [1, 3]] = np.clip(boxes_clean[:, [1, 3]], 0, h)
-
-        # Drop boxes that become degenerate after clipping
-        valid = (boxes_clean[:, 2] - boxes_clean[:, 0] > 1.0) & (boxes_clean[:, 3] - boxes_clean[:, 1] > 1.0)
-        return boxes_clean[valid]
+        return _clean_boxes_static(boxes, w, h)
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
@@ -151,16 +134,21 @@ def _load_coco(anno_path: Path) -> List[DetectionSample]:
     for img_id, items in samples.items():
         file_name = id_to_file[img_id]
         w, h = id_to_size[img_id]
-        boxes = np.array([it[0] for it in items], dtype=np.float32)
-        labels = [it[1] for it in items]
-        output.append(
-            DetectionSample(
-                path=C.BCCD_IMG_DIR / file_name,
-                boxes=boxes,
-                labels=labels,
-                size=(w, h),
+        boxes_raw = np.array([it[0] for it in items], dtype=np.float32)
+        boxes = _clean_boxes_static(boxes_raw, w, h)
+        if boxes.shape[0] != len(items):
+            labels = [it[1] for it in items[: boxes.shape[0]]]
+        else:
+            labels = [it[1] for it in items]
+        if boxes.size > 0:
+            output.append(
+                DetectionSample(
+                    path=C.BCCD_IMG_DIR / file_name,
+                    boxes=boxes,
+                    labels=labels,
+                    size=(w, h),
+                )
             )
-        )
     return output
 
 
@@ -186,11 +174,14 @@ def _load_voc(anno_dir: Path) -> List[DetectionSample]:
             y2 = float(bnd.findtext("ymax"))
             boxes.append([x1, y1, x2, y2])
             labels.append(cls)
-        if boxes:
+        boxes_clean = _clean_boxes_static(np.array(boxes, dtype=np.float32), w, h)
+        if boxes_clean.size > 0:
+            if boxes_clean.shape[0] != len(labels):
+                labels = labels[: boxes_clean.shape[0]]
             samples.append(
                 DetectionSample(
                     path=C.BCCD_IMG_DIR / filename,
-                    boxes=np.array(boxes, dtype=np.float32),
+                    boxes=boxes_clean,
                     labels=labels,
                     size=(w, h),
                 )
@@ -266,14 +257,18 @@ def _load_csv(anno_path: Path) -> List[DetectionSample]:
         if w is None or h is None:
             img = plt.imread(img_path)
             h, w = img.shape[:2]
-        output.append(
-            DetectionSample(
-                path=img_path,
-                boxes=boxes,
-                labels=labels,
-                size=(w, h),
+        boxes = _clean_boxes_static(boxes, w, h)
+        if boxes.shape[0] != len(labels):
+            labels = labels[: boxes.shape[0]]
+        if boxes.size > 0:
+            output.append(
+                DetectionSample(
+                    path=img_path,
+                    boxes=boxes,
+                    labels=labels,
+                    size=(w, h),
+                )
             )
-        )
     return output
 
 
@@ -302,6 +297,25 @@ def load_bccd_samples() -> List[DetectionSample]:
     raise FileNotFoundError(
         f"No annotations found. Expected COCO/VOC under {C.BCCD_ANNO_DIR} or CSV at {C.BCCD_ANNO_CSV}."
     )
+
+
+def _clean_boxes_static(boxes: np.ndarray, w: int, h: int) -> np.ndarray:
+    """Lightweight wrapper so annotation parsing and anchor fitting share the same cleanup."""
+
+    if boxes.size == 0:
+        return boxes.astype(np.float32)
+
+    boxes = boxes.astype(np.float32)
+    x1 = np.minimum(boxes[:, 0], boxes[:, 2])
+    x2 = np.maximum(boxes[:, 0], boxes[:, 2])
+    y1 = np.minimum(boxes[:, 1], boxes[:, 3])
+    y2 = np.maximum(boxes[:, 1], boxes[:, 3])
+
+    boxes_clean = np.stack([x1, y1, x2, y2], axis=-1)
+    boxes_clean[:, [0, 2]] = np.clip(boxes_clean[:, [0, 2]], 0, w)
+    boxes_clean[:, [1, 3]] = np.clip(boxes_clean[:, [1, 3]], 0, h)
+    valid = (boxes_clean[:, 2] - boxes_clean[:, 0] > 1.0) & (boxes_clean[:, 3] - boxes_clean[:, 1] > 1.0)
+    return boxes_clean[valid]
 
 
 class StdConv(nn.Conv2d):
@@ -533,7 +547,12 @@ class DetectionLoss(nn.Module):
         }
 
 
-def decode_predictions(preds: torch.Tensor, anchors: List[Tuple[int, int]], score_thresh: float):
+def decode_predictions(
+    preds: torch.Tensor,
+    anchors: List[Tuple[int, int]],
+    score_thresh: float,
+    max_boxes: int = C.BCCD_MAX_BOXES,
+):
     bs, _, h, w = preds.shape
     num_anchors = len(anchors)
     num_classes = len(C.BCCD_CLASSES)
@@ -570,6 +589,11 @@ def decode_predictions(preds: torch.Tensor, anchors: List[Tuple[int, int]], scor
         b_scores = scores[b][b_mask]
         b_cls = cls_idx[b][b_mask]
         keep = nms(b_boxes, b_scores, C.BCCD_NMS_IOU)
+        if keep.numel() > 0:
+            # sort by confidence to ensure deterministic top-K selection
+            keep_scores = b_scores[keep]
+            sorted_idx = torch.argsort(keep_scores, descending=True)
+            keep = keep[sorted_idx][: max_boxes]
         outputs.append((b_boxes[keep], b_cls[keep], b_scores[keep]))
     return outputs
 
