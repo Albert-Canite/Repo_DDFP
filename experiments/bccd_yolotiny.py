@@ -488,7 +488,16 @@ def build_targets(
     grid_size: int,
     num_classes: int,
     ignore_thresh: float = 0.5,
+    neighbor_range: int = 0,
+    debug: bool = False,
 ):
+    """YOLO-style target assignment.
+
+    - Only the best IoU anchor is marked positive per GT (optionally on a small neighbourhood).
+    - Anchors (except the best) whose IoU is above ``ignore_thresh`` are put into ``ignore_mask``.
+    - All remaining locations stay negative.
+    """
+
     device = boxes.device
     bs = boxes.shape[0]
     num_anchors = len(anchors)
@@ -496,37 +505,84 @@ def build_targets(
     ignore_mask = torch.zeros(bs, num_anchors, grid_size, grid_size, device=device)
     anchor_tensor = torch.tensor(anchors, device=device, dtype=torch.float32)
 
+    debug_printed = False
+
     for b in range(bs):
-        for box, cls in zip(boxes[b], labels[b]):
-            if box.numel() == 0 or cls < 0:
-                continue
+        # Count GTs per image (excluding padding/invalid entries) for debugging
+        valid_gt_mask = (labels[b] >= 0) & ((boxes[b].sum(dim=-1)) > 0)
+        valid_indices = valid_gt_mask.nonzero(as_tuple=False).squeeze(-1)
+
+        for idx in valid_indices:
+            box = boxes[b, idx]
+            cls = int(labels[b, idx].item())
             cx = 0.5 * (box[0] + box[2])
             cy = 0.5 * (box[1] + box[3])
             bw = (box[2] - box[0])
             bh = (box[3] - box[1])
             if bw <= 0 or bh <= 0:
                 continue
+
             gi = int(cx * grid_size)
             gj = int(cy * grid_size)
-            if gi >= grid_size or gj >= grid_size:
+            if gi < 0 or gj < 0 or gi >= grid_size or gj >= grid_size:
                 continue
+
             box_wh = torch.tensor([bw * C.IMAGE_SIZE, bh * C.IMAGE_SIZE], device=device)
-            anchor_wh = anchor_tensor
-            iou = bbox_wh_iou(box_wh[None], anchor_wh).squeeze(0)
-            order = torch.argsort(iou, descending=True)
-            placed = False
-            for idx_anchor in order[: min(3, num_anchors)]:  # allow multiple boxes per cell via different anchors
-                if targets[b, idx_anchor, gj, gi, 4] == 0:
-                    targets[b, idx_anchor, gj, gi, 0:4] = torch.tensor(
+            iou_per_anchor = bbox_wh_iou(box_wh[None], anchor_tensor).squeeze(0)
+            best_anchor = int(torch.argmax(iou_per_anchor).item())
+
+            offsets = [(0, 0)]
+            if neighbor_range > 0:
+                for dy in range(-neighbor_range, neighbor_range + 1):
+                    for dx in range(-neighbor_range, neighbor_range + 1):
+                        if dx == 0 and dy == 0:
+                            continue
+                        offsets.append((dy, dx))
+
+            for dy, dx in offsets:
+                gj_off = gj + dy
+                gi_off = gi + dx
+                if gj_off < 0 or gi_off < 0 or gj_off >= grid_size or gi_off >= grid_size:
+                    continue
+
+                if targets[b, best_anchor, gj_off, gi_off, 4] == 0:
+                    targets[b, best_anchor, gj_off, gi_off, 0:4] = torch.tensor(
                         [cx, cy, bw, bh], device=device
                     )
-                    targets[b, idx_anchor, gj, gi, 4] = 1.0
-                    targets[b, idx_anchor, gj, gi, 5 + cls] = 1.0
-                    placed = True
-                    break
+                    targets[b, best_anchor, gj_off, gi_off, 4] = 1.0
+                    targets[b, best_anchor, gj_off, gi_off, 5 + cls] = 1.0
 
-            if placed:
-                ignore_mask[b, :, gj, gi] = torch.where(iou > ignore_thresh, 1.0, ignore_mask[b, :, gj, gi])
+                # Ignore all non-best anchors with high IoU at this location
+                for anchor_idx in range(num_anchors):
+                    if anchor_idx == best_anchor:
+                        continue
+                    if iou_per_anchor[anchor_idx] > ignore_thresh:
+                        ignore_mask[b, anchor_idx, gj_off, gi_off] = 1.0
+
+            if debug and not debug_printed:
+                pos_map = targets[b, best_anchor, :, :, 4].detach().cpu()
+                print("===== Target assignment debug (first GT) =====")
+                print(f"image_index={b} anchor={best_anchor} grid={grid_size}x{grid_size}")
+                print(f"gt_box=[{box[0]:.4f},{box[1]:.4f},{box[2]:.4f},{box[3]:.4f}] class={cls}")
+                print("positive map (1 indicates positive cell for best anchor):")
+                print(pos_map.int().tolist())
+                debug_printed = True
+
+    if debug:
+        obj_mask = targets[..., 4]
+        noobj_mask = (1.0 - obj_mask) * (1.0 - ignore_mask)
+        for b in range(bs):
+            gt_count = int(((labels[b] >= 0) & ((boxes[b].sum(dim=-1)) > 0)).sum().item())
+            obj_count = int(obj_mask[b].sum().item())
+            noobj_count = int(noobj_mask[b].sum().item())
+            ignore_count = int(ignore_mask[b].sum().item())
+            grid_elems = grid_size * grid_size
+            pos_ratio = obj_count / float(max(1, grid_elems))
+            print(
+                f"[Assign stats] img={b} gt={gt_count} obj_mask={obj_count} "
+                f"noobj_mask={noobj_count} ignore_mask={ignore_count} pos/grid={pos_ratio*100:.2f}%"
+            )
+
     return targets, ignore_mask
 
 
@@ -576,6 +632,42 @@ def bbox_ciou(pred, target):
     return ciou
 
 
+def bbox_ciou_xyxy(pred_xyxy: torch.Tensor, tgt_xyxy: torch.Tensor) -> torch.Tensor:
+    px1, py1, px2, py2 = pred_xyxy.unbind(-1)
+    tx1, ty1, tx2, ty2 = tgt_xyxy.unbind(-1)
+
+    eps = 1e-7
+    pw = (px2 - px1).clamp(min=eps)
+    ph = (py2 - py1).clamp(min=eps)
+    tw = (tx2 - tx1).clamp(min=eps)
+    th = (ty2 - ty1).clamp(min=eps)
+
+    inter_x1 = torch.max(px1, tx1)
+    inter_y1 = torch.max(py1, ty1)
+    inter_x2 = torch.min(px2, tx2)
+    inter_y2 = torch.min(py2, ty2)
+
+    inter = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
+    union = pw * ph + tw * th - inter + eps
+    iou = inter / union
+
+    pred_cx = (px1 + px2) / 2
+    pred_cy = (py1 + py2) / 2
+    tgt_cx = (tx1 + tx2) / 2
+    tgt_cy = (ty1 + ty2) / 2
+
+    cw = torch.max(px2, tx2) - torch.min(px1, tx1)
+    ch = torch.max(py2, ty2) - torch.min(py1, ty1)
+    c2 = cw ** 2 + ch ** 2 + eps
+
+    rho2 = (pred_cx - tgt_cx) ** 2 + (pred_cy - tgt_cy) ** 2
+    v = (4 / (math.pi ** 2)) * torch.pow(torch.atan(tw / th) - torch.atan(pw / ph), 2)
+    with torch.no_grad():
+        alpha = v / torch.clamp(1 - iou + v, min=1e-6)
+    ciou = iou - (rho2 / c2 + alpha * v)
+    return ciou
+
+
 class DetectionLoss(nn.Module):
     def __init__(self, num_classes: int):
         super().__init__()
@@ -590,11 +682,33 @@ class DetectionLoss(nn.Module):
         # Only compute IoU on positive locations to avoid NaNs from padded or empty boxes
         pos_mask = obj_mask.squeeze(-1) > 0
         if pos_mask.any():
-            box_pred = preds[..., 0:4][pos_mask]
-            box_tgt = targets[..., 0:4][pos_mask]
-            ciou_pos = bbox_ciou(box_pred, box_tgt).clamp(min=0.0)
-            box_loss = (1.0 - ciou_pos)
-            mean_ciou = ciou_pos.mean()
+            box_pred_cxcywh = preds[..., 0:4][pos_mask]
+            box_tgt_cxcywh = targets[..., 0:4][pos_mask]
+
+            box_pred_xyxy = _cxcywh_to_xyxy(box_pred_cxcywh)
+            box_tgt_xyxy = _cxcywh_to_xyxy(box_tgt_cxcywh)
+
+            ciou_pos_cxcywh = bbox_ciou(box_pred_cxcywh, box_tgt_cxcywh).clamp(min=0.0)
+            ciou_pos_xyxy = bbox_ciou_xyxy(box_pred_xyxy, box_tgt_xyxy).clamp(min=0.0)
+
+            box_loss = (1.0 - ciou_pos_xyxy)
+            mean_ciou = ciou_pos_xyxy.mean()
+
+            if not hasattr(self, "_debug_box_printed"):
+                self._debug_box_printed = True
+                first_pred_cxcywh = box_pred_cxcywh[0].detach().cpu()
+                first_tgt_cxcywh = box_tgt_cxcywh[0].detach().cpu()
+                first_pred_xyxy = box_pred_xyxy[0].detach().cpu()
+                first_tgt_xyxy = box_tgt_xyxy[0].detach().cpu()
+                first_ciou_cxcywh = ciou_pos_cxcywh[0].detach().cpu().item()
+                first_ciou_xyxy = ciou_pos_xyxy[0].detach().cpu().item()
+                print("===== Box regression debug (first positive) =====")
+                print(f"pred_cxcywh={first_pred_cxcywh.tolist()}")
+                print(f"tgt_cxcywh={first_tgt_cxcywh.tolist()}")
+                print(f"pred_xyxy={first_pred_xyxy.tolist()}")
+                print(f"tgt_xyxy={first_tgt_xyxy.tolist()}")
+                print(f"ciou_cxcywh(old)={first_ciou_cxcywh:.6f}")
+                print(f"ciou_xyxy(new)={first_ciou_xyxy:.6f}")
         else:
             box_loss = torch.zeros(1, device=preds.device)
             mean_ciou = torch.tensor(0.0, device=preds.device)
@@ -767,7 +881,14 @@ def train_epoch(model, loader, optimizer, scheduler, device, anchors, loss_fn):
         raw = model(imgs)
         pred_boxes, pred_obj, pred_cls, grid = _decode_raw(raw, anchors)
         targets, ignore_mask = build_targets(
-            boxes, labels, anchors, grid, len(C.BCCD_CLASSES), ignore_thresh=C.BCCD_IGNORE_IOU
+            boxes,
+            labels,
+            anchors,
+            grid,
+            len(C.BCCD_CLASSES),
+            ignore_thresh=C.BCCD_IGNORE_IOU,
+            neighbor_range=0,
+            debug=(step == 1),
         )
         preds = torch.cat([pred_boxes, pred_obj, pred_cls], dim=-1)
         loss, detail = loss_fn(preds, targets, ignore_mask)
@@ -814,7 +935,14 @@ def evaluate_loss(model, loader, device, anchors, loss_fn):
             raw = model(imgs)
             pred_boxes, pred_obj, pred_cls, grid = _decode_raw(raw, anchors)
             targets, ignore_mask = build_targets(
-                boxes, labels, anchors, grid, len(C.BCCD_CLASSES), ignore_thresh=C.BCCD_IGNORE_IOU
+                boxes,
+                labels,
+                anchors,
+                grid,
+                len(C.BCCD_CLASSES),
+                ignore_thresh=C.BCCD_IGNORE_IOU,
+                neighbor_range=0,
+                debug=False,
             )
 
             preds = torch.cat([pred_boxes, pred_obj, pred_cls], dim=-1)
