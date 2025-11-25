@@ -255,12 +255,12 @@ def _load_csv(anno_path: Path) -> List[DetectionSample]:
             print(f"[Warning] image not found for annotation: {img_path}")
             continue
         boxes = np.array(data["boxes"], dtype=np.float32)
-        _validate_annotation(boxes, (w, h), anno_path)
-        labels = data["labels"]
         w, h = data["size"]
         if w is None or h is None:
             img = plt.imread(img_path)
             h, w = img.shape[:2]
+        _validate_annotation(boxes, (w, h), anno_path)
+        labels = data["labels"]
         boxes = _clean_boxes_static(boxes, w, h)
         if boxes.shape[0] != len(labels):
             labels = labels[: boxes.shape[0]]
