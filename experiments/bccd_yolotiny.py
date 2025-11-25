@@ -506,6 +506,8 @@ def build_targets(
     ignore_mask = torch.zeros(bs, num_anchors, grid_size, grid_size, device=device)
     anchor_tensor = torch.tensor(anchors, device=device, dtype=torch.float32)
 
+    debug_printed = False
+
     for b in range(bs):
         valid_gt_mask = (labels[b] >= 0) & ((boxes[b].sum(dim=-1)) > 0)
         valid_indices = valid_gt_mask.nonzero(as_tuple=False).squeeze(-1)
